@@ -49,28 +49,40 @@ func main() {
 	fmt.Println("module boundaries OK")
 }
 
+// listPackages runs `go list -json ./...` inside each workspace module's own
+// directory and merges the results. The repo root is not itself a Go module
+// (only go.work lives there), so `./...` run from the root cannot resolve —
+// it must be run from within each module's directory tree instead.
 func listPackages() ([]pkgInfo, error) {
-	cmd := exec.Command("go", "list", "-json", "./...")
-	out, err := cmd.Output()
+	dirsOut, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}").Output()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("go list -m: %w", err)
 	}
-	// `go list -json` emits consecutive top-level objects, not a JSON array.
-	// Decoder.More() is only meaningful inside an array or object, so looping
-	// on it reads nothing here — and a checker that finds zero packages reports
-	// success while checking nothing.
+
 	var pkgs []pkgInfo
-	dec := json.NewDecoder(bytes.NewReader(out))
-	for {
-		var p pkgInfo
-		err := dec.Decode(&p)
-		if errors.Is(err, io.EOF) {
-			break
-		}
+	for _, dir := range strings.Fields(string(dirsOut)) {
+		cmd := exec.Command("go", "list", "-json", "./...")
+		cmd.Dir = dir
+		out, err := cmd.Output()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("go list ./... in %s: %w", dir, err)
 		}
-		pkgs = append(pkgs, p)
+		// `go list -json` emits consecutive top-level objects, not a JSON
+		// array. Decoder.More() is only meaningful inside an array or
+		// object, so looping on it reads nothing here — and a checker that
+		// finds zero packages reports success while checking nothing.
+		dec := json.NewDecoder(bytes.NewReader(out))
+		for {
+			var p pkgInfo
+			err := dec.Decode(&p)
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			pkgs = append(pkgs, p)
+		}
 	}
 	return pkgs, nil
 }
