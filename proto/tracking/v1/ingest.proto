@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package tracking.v1;
+
+import "tracking/v1/event.proto";
+
+message BatchRequest {
+  int64 sent_at = 1;              // client wall clock at send, millis
+  repeated Event events = 2;      // <= 500, <= 1 MB decompressed
+}
+
+// Reject codes. Stable strings — the SDK logs them and support reads them.
+message Reject {
+  string event_id = 1;
+  string code     = 2;   // INVALID_PROPERTY_TYPE | MISSING_EVENT_ID | ...
+  string message  = 3;
+}
+
+// Always partial-success shaped. A single malformed event must never fail the
+// whole batch: the client would retry forever and the outbox would never drain.
+message BatchResponse {
+  int64 received_at = 1;
+  repeated string accepted = 2;
+  repeated Reject rejected = 3;
+}
+
+message TokenRequest {
+  string client_id   = 1;   // public, embedded in the SDK, authorizes nothing
+  string platform    = 2;   // "ios" | "android"
+  string attestation = 3;   // App Attest / Play Integrity blob; may be empty
+}
+
+message TokenResponse {
+  string access_token = 1;  // EdDSA JWT, typ=at+jwt
+  int64  expires_in   = 2;  // seconds; 1800-3600
+  uint32 trust_tier   = 3;  // 0 = attested, 1 = attestation unavailable
+}
