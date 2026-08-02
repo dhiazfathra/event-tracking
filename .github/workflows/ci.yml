@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # buf breaking needs history
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: 1.47.2
+
+      - name: Lint protos
+        run: buf lint
+
+      # An SDK deployed into third-party apps cannot be force-upgraded, so a
+      # breaking envelope change is unfixable once shipped.
+      # Single quotes would pass the literal $(...) to buf. The tag and the
+      # no-tag fallback also need different buf revision syntax: `tag=` only
+      # accepts a real tag, so HEAD~1 must be given as `ref=`.
+      - name: Breaking change check
+        run: |
+          tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -n "$tag" ]; then
+            buf breaking --against ".git#tag=$tag"
+          else
+            buf breaking --against '.git#ref=HEAD~1'
+          fi
+
+      - name: Generated code is up to date
+        run: make gen-check
+
+      - name: Module boundaries
+        run: make check-boundaries
+
+      - name: Go tests
+        run: make test
