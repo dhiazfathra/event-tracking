@@ -14,7 +14,7 @@ gen-check: gen
 
 lint:
 	buf lint
-	golangci-lint run ./...
+	@for d in $$(go list -m -f '{{.Dir}}'); do (cd "$$d" && golangci-lint run ./...) || exit 1; done
 
 check-boundaries:
 	go run ./tools/checkboundaries
