@@ -23,6 +23,7 @@ The platform must decide where duplicates are resolved: at write time (server-si
 - The client assigns a UUID v7 `event_id` at capture time. It is stable across every retry of that event.
 - The client retries freely on `429`, `5xx`, and timeouts.
 - Queries count distinct events with `uniqExact(event_id)`, never `count(*)`.
+- **Row-returning and property-aggregating queries need the same discipline.** `uniqExact(event_id)` solves distinct-event *counts*, but the DSL also serves property breakdowns and per-user session inspection, which return or aggregate one row per event. Those paths would double-count an unmerged duplicate just as `count(*)` would. Since `FINAL` is banned, every such query must deduplicate explicitly — group by `event_id` and take `argMax(col, ts_received)` per event before aggregating or returning. A DSL path that cannot be expressed that way must be restricted to distinct-event metrics rather than shipped with a known double-count. This is a compiler-level obligation in `pkg/querydsl` (ADR-0006), enforced by golden tests, not a convention for query authors to remember.
 - The table uses `ReplacingMergeTree(ts_received)`, which collapses duplicates during background merges so storage does not grow unboundedly.
 - `FINAL` is never used in queries.
 

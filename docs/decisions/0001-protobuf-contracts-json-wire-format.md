@@ -31,7 +31,16 @@ Pin the proto↔JSON encoding with golden fixtures in `testdata/golden/`, read b
 - Null handling: `null` is accepted as equivalent to "field absent" on decode; the encoder never emits `null` for an unpopulated field (see `emitUnpopulated` above).
 - MIME type: `application/json` on the wire (not `application/protobuf+json`) — this is the format proxies and tooling already understand, consistent with the JSON-not-binary decision above.
 
-The golden fixtures in `testdata/golden/` encode exactly this configuration; a change to any of these settings is a breaking change to the fixtures and must go through `buf breaking` review.
+The golden fixtures in `testdata/golden/` encode exactly this configuration.
+
+**`buf breaking` does not cover any of it.** `buf breaking` checks Protobuf *schema* compatibility — added, removed, renumbered fields. Every setting above is an encoding option, invisible to it: flipping `emitUnpopulated` or switching enums to numeric changes the bytes on the wire while the schema stays perfectly compatible, and `buf breaking` passes. That is precisely the change that would silently break a shipped SDK.
+
+So CI runs two independent gates:
+
+1. **`buf breaking`** against the previous release tag — schema compatibility.
+2. **A golden-fixture diff** — both the Go and the Dart suites encode and decode the fixtures in `testdata/golden/` and assert byte equality. A changed encoder option makes this fail in both languages, and the diff shows exactly what moved on the wire.
+
+Neither gate substitutes for the other. Treating the fixtures as merely illustrative, or assuming `buf breaking` guards the wire format, reintroduces the drift this ADR exists to prevent.
 
 ## Alternatives Considered
 

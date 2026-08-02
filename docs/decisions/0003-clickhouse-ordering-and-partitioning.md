@@ -38,6 +38,10 @@ The `by_user` projection — `ORDER BY (tenant_id, user_id, ts)` — is specifie
 - **`name` second** — dashboards pin one event name. Low cardinality keeps the prefix cheap.
 - **`ts` third** — the range-scan dimension.
 - **`event_id` last** — makes the sort key unique, which `ReplacingMergeTree` requires to collapse actual duplicates rather than distinct rows sharing a key.
+
+**Every ordering field must be deterministic per `event_id`, not just `event_id` itself.** `ReplacingMergeTree` collapses two rows only when they share the *entire* `ORDER BY` key *and* land in the same partition. A stable `event_id` alone is not sufficient. The trap is clock-skew correction: `ts = ts_client + (server_received − client_sent_at)` (spec §3.3) recomputes on every attempt, and a retry has a different `server_received` and `client_sent_at`. The corrected `ts` therefore drifts between attempts, changing the row's position under `ts` and — for an event near midnight UTC — its `event_date` and thus its partition. Duplicates would then never merge, and the storage reclamation this engine was chosen for silently stops working.
+
+The invariant: **the skew offset is per-session, not per-request.** It is computed on first contact for a `(tenant_id, device_id, session_id)` and persisted, then reused for every event in that session including retries. `ts_client` is already immutable — captured at capture time and stored in the outbox — so with a stable offset, `ts` and `event_date` become pure functions of the event and dedup works as intended. `name` and `tenant_id` are already immutable per event. This is a correctness requirement on the ingest path, not an optimization.
 - **Monthly partitions** — 13-month TTL yields 13 partitions. Daily would yield ~400 with more merge pressure and no query benefit the `ts` sort key does not already provide.
 
 ## Alternatives Considered

@@ -25,6 +25,10 @@ Write throughput is modest: a busy app emits tens of events per second, not thou
 
 Use **drift** over SQLite, with `PRAGMA journal_mode=WAL` and `PRAGMA synchronous=NORMAL`.
 
+**The durability boundary is application crash, not power loss.** This is a real limit, not a technicality: in WAL mode `synchronous=NORMAL` does not fsync on every commit, so SQLite guarantees the database stays *consistent* after a power cut or hard reboot, but the most recent committed transactions can roll back. A process crash — the far more common case, and the one the outbox exists for — loses nothing, because the committed data is already in the WAL and the OS owns it. A power loss or kernel panic in the seconds after a capture can lose those captures.
+
+`synchronous=FULL` would close that gap by fsyncing every commit, at the cost of a disk sync per captured event on a mobile device — meaningful battery and latency for a telemetry SDK writing tens of events per second inside someone else's app. Accepting a narrow power-loss window is the right trade here, but it must be *stated*, because §Consequences and the spec's delivery contract both claim the outbox is durable, and "durable" without this qualifier overstates it.
+
 Two tables plus a counters table: `outbox`, `query_cache`, `counters`.
 
 The outbox is **bounded at 10,000 total rows, across every state**. On overflow the oldest **`pending`** rows are dropped first, incrementing `dropped_events`. If the table is at 10,000 and every row is `inflight` (no `pending` row exists to evict — meaning a flush is in progress or stuck), the new capture is dropped instead of exceeding the cap, and that drop also increments `dropped_events`. The cap is a hard ceiling on the table, not a ceiling on `pending` alone; there is no state that can grow it past 10,000.
@@ -73,5 +77,5 @@ Events are inserted **immediately** on capture. `Tracker.track()` awaits the SQL
 
 - `build_runner` and generated files enter the SDK build. Accepted for migration safety.
 - `inflight` is a persisted state, not an in-memory flag. Rows stuck in `inflight` for more than 5 minutes reset to `pending` — checked both on SDK init and at the start of every flush cycle, not init alone. Init-only recovery would leave a row stuck until the next process restart if a request times out or the flush worker dies mid-request while the app keeps running for hours; checking every flush cycle bounds the stuck window to one cycle instead. This is safe because of the stable `event_id` from ADR-0004: re-claiming and resending a falsely-`inflight` row is an ordinary retry, not a special case.
-- Very long offline periods, or the outbox filling with `inflight` rows (see the overflow policy above), lose the oldest events. The loss is visible via `sdk_dropped_events`, never silent.
+- Overflow loss has two distinct shapes, and which one applies depends on the outbox state. When `pending` rows exist, the **oldest** of them are evicted — a long offline period therefore loses the oldest telemetry first. When all 10,000 rows are `inflight` and none can be evicted, it is the **incoming** capture that is dropped instead. Both increment `dropped_events` and surface via `sdk_dropped_events`; neither is silent.
 - `Tracker.track()` never throws into host app code and never blocks meaningfully. A telemetry SDK that can crash the app it measures is a liability.

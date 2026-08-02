@@ -32,13 +32,13 @@ Add a queue when one of these three triggers fires, not before:
 
 - Pros: Standard, well understood, enables replay and fan-out, absorbs spikes.
 - Cons: A second stateful cluster; a consumer service to write, deploy, and monitor; partition, offset, lag, and rebalance operations; a whole new class of failure modes.
-- Rejected for now: It buys durability the system already has. Listed as a triggered addition above.
+- Rejected for now: **within the scope the outbox already covers**, it duplicates existing durability. That scope is narrower than Kafka's and the difference is real: the outbox is bounded, per-device retry storage, so it does not survive an uninstall, an outbox overflow, an outage longer than the retry budget, or a device that never comes back. Kafka would provide central retention and replay across all of those. The judgment is that those cases are acceptable losses at this scale (they are documented in Consequences and in ADR-0004's bounded-loss contract), not that Kafka would add nothing. Listed as a triggered addition above.
 
 ### Ingest-side write-ahead log to disk or S3, replayed on recovery
 
 - Pros: Cheaper than Kafka, survives ClickHouse downtime.
 - Cons: Custom durable-storage code — the most dangerous kind to hand-roll — plus a replay path that only executes during incidents and is therefore never exercised.
-- Rejected: Strictly worse than letting clients hold data, since they hold it anyway.
+- Rejected: for the failure modes the client outbox already covers, this adds custom durable-storage code without adding reach — the clients hold the data anyway. It would help in the cases the outbox misses (uninstall, overflow, long outages), but a WAL replayed only during incidents is the weakest possible answer to those; if they start mattering, trigger 1 or 3 fires and the answer is a real queue, not a hand-rolled log.
 
 ### In-process buffering in the ingest service with fast acknowledgement
 

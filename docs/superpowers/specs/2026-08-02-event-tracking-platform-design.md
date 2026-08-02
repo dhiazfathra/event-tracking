@@ -213,8 +213,9 @@ Response is **always partial-success shaped**:
 ### 3.3 Enrichment and trust
 
 - **`tenant_id`** — from the verified JWT's `tenant_id` claim (§3.9), not from a database lookup on the hot path and never from the request body.
-- **`trust_tier`** — from the JWT's `trust_tier` claim, persisted on every row. Tier 1 traffic is sampled at ingest.
-- **Clock skew correction** — `ts = ts_client + (received_at_server − sent_at_client)`. Mobile clocks are wrong by minutes to years. Both `ts_client` (raw) and `ts` (corrected) are stored; `ts` is what queries use.
+- **`trust_tier`** — from the JWT's `trust_tier` claim, persisted on every row. Tier 1 traffic is rate-limited, never sampled (§3.9) — every accepted event is stored.
+- **Clock skew correction** — `ts = ts_client + offset`, where `offset` is computed once per `(tenant_id, device_id, session_id)` on first contact and persisted for the session. Mobile clocks are wrong by minutes to years. Both `ts_client` (raw) and `ts` (corrected) are stored; `ts` is what queries use.
+- **The offset must be per-session, not per-request.** Recomputing `(received_at_server − sent_at_client)` on each attempt would give a retry a different `ts` than its original — moving the row under the `ts` sort key and, near midnight UTC, into a different partition. `ReplacingMergeTree` collapses only rows sharing the full sort key within one partition, so drifting timestamps would stop duplicates from ever merging (ADR-0003). A persisted per-session offset keeps `ts` and `event_date` deterministic per `event_id`.
 - **Skew clamp** — corrected timestamps more than 24h in the future or 30d in the past are clamped to `received_at` and flagged. Without this a single device with a broken clock creates partitions years out and wrecks the partition count.
 - **`ts_received`** — server-set, also the `ReplacingMergeTree` version column.
 - **Quota** — Redis counter per `(tenant_id, day)`. Over quota returns `429`, and the client's backoff keeps the retry pressure bounded.
@@ -229,7 +230,9 @@ Batching happens in three places, deliberately:
 
 **Tradeoff:** `wait_for_async_insert=1` adds up to ~1s to p99 ingest latency. `=0` acks in microseconds but silently drops data if ClickHouse rejects the insert, which is incompatible with promising at-least-once. Latency is the correct thing to trade here — nobody is watching an ingestion request finish.
 
-**What `200` actually guarantees:** `wait_for_async_insert=1` confirms the data was flushed to the ClickHouse node(s) that received the insert — it does not wait for replication to other replicas or for any backup copy. At initial scale (§3.8) the cluster is a single node, so "flushed" and "durable" are the same thing. Once replication is introduced, this needs a stated `insert_quorum` (or equivalent) so `200` continues to mean what the client's outbox deletion assumes: the event is safe to forget. Until then, node-level flush is the durability boundary, and it is a single point of failure — acceptable at this stage because the client outbox holds the data until it gets a `200` in the first place, so a lost unreplicated write surfaces as a retry, not silent loss.
+**What `200` actually guarantees:** `wait_for_async_insert=1` confirms the data was flushed to the ClickHouse node(s) that received the insert — it does not wait for replication to other replicas or for any backup copy. At initial scale (§3.8) the cluster is a single node, so "flushed" and "durable" are the same thing. Once replication is introduced, this needs a stated `insert_quorum` (or equivalent) so `200` continues to mean what the client's outbox deletion assumes: the event is safe to forget. Until then, node-level flush is the durability boundary, and it is a single point of failure.
+
+**Be precise about what the outbox does and does not cover here.** Before the `200`, the client still holds the event, so a failed insert surfaces as a retry. After the `200`, the client deletes the row — at that moment the single ClickHouse node holds the only copy. If that node loses flushed data before replication or backups exist, the event is gone with no retry path and no counter. This is **accepted risk at single-node scale**, not a case the outbox rescues, and it is the strongest argument for adding a replica early: the fix is either `insert_quorum` before acknowledging, or node-level backups, and until one exists post-ack node loss is unrecoverable.
 
 ### 3.5 ClickHouse schema
 
@@ -329,7 +332,13 @@ The alternative — rebuilding rollups nightly from the deduplicated raw table �
 
 **Retention and deletion are matched to the raw table, not independently correct.** `events_daily` carries the same 13-month TTL as `events` so a rollup row cannot outlive its source data. Deletion is the harder case: an `ALTER TABLE events ... DELETE` (per-user GDPR request, §7) removes rows from `events` but does **not** retroactively subtract their contribution from `events_daily` — the materialized view already summed them in. Until a subtraction or rebuild path exists, any per-user deletion must also trigger a rebuild of the affected `events_daily` partitions from the now-deleted-from raw table (`INSERT INTO events_daily SELECT ... FROM events WHERE event_date = ... GROUP BY ...` after clearing the partition), not just the raw-table mutation. This is real operational work and is called out explicitly in §7 as an open question to resolve before the first deletion request, precisely because rollup responses must not go on serving a deleted user's data after the platform has told them it's gone.
 
-**The rebuild window itself is a gap, not just the rebuild mechanics.** While a partition is being cleared and reinserted, a query routed to `events_daily` for that `(tenant_id, event_date)` can hit a stale, partially-rebuilt, or momentarily empty partition. The deletion path is not safe until the query service does all of the following, in order: mark the affected `(tenant_id, event_date)` partitions as rebuilding *before* the deletion mutation starts; route coarse queries for those partitions to raw `events` instead of `events_daily` for the duration; only resume rollup routing once the raw mutation and the partition rebuild have both completed; and invalidate any cached rollup-backed responses (§4.4 query cache) for the affected tenant and date range, so a client doesn't keep serving a pre-deletion cached aggregate past its TTL. None of this exists yet — it is required before rollup reads can be considered safe to enable alongside per-user deletion, and is folded into the same §7 open question rather than treated as solved by the TTL and rebuild alone.
+**The rebuild window itself is a gap, not just the rebuild mechanics.** While a partition is being cleared and reinserted, a query routed to `events_daily` for that `(tenant_id, event_date)` can hit a stale, partially-rebuilt, or momentarily empty partition. The deletion path is not safe until the query service does the following, in order: mark the affected `(tenant_id, event_date)` partitions as rebuilding *before* the deletion mutation starts; route coarse queries for those partitions to raw `events` instead of `events_daily` for the duration; only resume rollup routing once the raw mutation and the partition rebuild have both completed; and invalidate cached rollup-backed responses for the affected tenant and date range.
+
+**Marking a partition "rebuilding" only protects readers — writers need a fence.** The materialized view is insert-triggered and is not synchronized with mutations on the source table, so it keeps firing throughout the clear-and-rebuild. An event inserted mid-rebuild can be missed by the rebuild's `SELECT` snapshot and then wiped by the partition clear, or double-counted if it lands in both. The rebuild therefore needs a per-partition write fence or watermark: record the fence position before clearing, rebuild from raw data up to that watermark, then replay or serialize post-fence inserts before reopening rollup routing. Without this the rebuild silently drops live traffic for the affected dates.
+
+**Cache invalidation is harder than "invalidate" implies, because the cache is on the device.** `query_cache` lives in the Flutter client (§4.1); the server cannot push an eviction to an offline phone, and §7 still lists invalidation as an open question. A TTL alone means a client can keep serving a pre-deletion aggregate — including the deleted user's contribution — for the rest of its TTL, after the platform has told that user their data is gone. Closing this needs a **deletion epoch**: a per-tenant counter, incremented on every deletion, included in the query response and folded into the client's cache key. A client presenting a stale epoch gets a full response rather than a `304`, so its cached entry is orphaned rather than served. Until that exists, rollup-backed responses must not be cached client-side for tenants with pending deletions.
+
+None of this exists yet — it is required before rollup reads can be considered safe to enable alongside per-user deletion, and is folded into the same §7 open question rather than treated as solved by the TTL and rebuild alone.
 
 ### 3.8 Scaling path
 
@@ -360,21 +369,27 @@ app start
 POST /v1/auth/token          ← client_id + platform attestation
    │                            (App Attest / Play Integrity)
    ▼
-JWT (ES256/EdDSA, exp 30–60m)
-   claims: tenant_id, install_id, scope=write:events, trust_tier
+JWT (EdDSA/Ed25519, exp 30–60m)
+   claims: tenant_id, install_id (server-issued), scope=write:events,
+           trust_tier, iss, aud, nbf, kid
    │
    ▼
 POST /v1/batch               ← Authorization: Bearer <JWT>
-   ingest verifies signature via JWKS public key — holds no shared secret
+   ingest verifies via JWKS public key — holds no shared secret
 ```
 
+**Acceptance is not just signature verification.** Ingest rejects with `401` unless every one of these holds: `alg` is `EdDSA` (checked against an allowlist before verification — `none` and all HMAC algorithms rejected outright, never inferred from the token header), `typ` is `at+jwt`, `iss` matches the platform issuer exactly, `aud` matches the ingest audience exactly, `exp`/`nbf` are valid within ≤60s skew, `scope` contains `write:events`, and `kid` resolves in the JWKS. A valid signature alone does not bind a token to this endpoint — the `iss`/`aud` checks are what stop a token minted for another audience from being replayed here. JWKS keys are cached with a bounded TTL; rotation overlaps old and new so in-flight tokens stay verifiable, and a `kid` miss triggers at most one rate-limited refetch so forged `kid` values can't drive unbounded JWKS traffic.
+
 - **Attestation runs at the exchange, not at ingest.** Ingest stays a hot path that only verifies a signature. Bundle-ID and origin headers are kept as telemetry, never as a control — `curl` sets them.
-- **Attestation failure does not block; it assigns a trust tier.** Tier 0 (attested) gets normal limits. Tier 1 (attestation unavailable) gets tight limits and sampled ingestion. Rooted, custom-ROM, and de-Googled devices fail attestation *legitimately*; simulators fail; Play Integrity is quota-limited. Blocking would buy little and cost real users.
+- **Attestation failure does not block; it assigns a trust tier.** Tier 0 (attested) gets normal rate limits. Tier 1 (attestation unavailable) gets tighter rate limits — **not** sampling. Rooted, custom-ROM, and de-Googled devices fail attestation *legitimately*; simulators fail; Play Integrity is quota-limited. Blocking would buy little and cost real users. Sampling was rejected because silently discarding an event behind a `200` destroys it: the client deletes the outbox row on acknowledgement, so there is no retry and no counter. Rate limiting returns `429`, which the SDK already backs off on and which degrades into ordinary counted loss. Same cost control, no hole in the guarantee.
+- **`install_id` is server-issued at the exchange, never client-supplied.** It is the primary rate-limit bucket, so a client able to choose or rotate it could reset its own limit at will and spend the tenant's budget indefinitely. Derived from the attestation payload at Tier 0; minted and persisted server-side at Tier 1.
 - **Rate limits key on `install_id` first, tenant second, IP last.** IP-primary limiting is actively harmful here: Indonesian carriers CGNAT aggressively, so one Telkomsel egress IP is thousands of real users. IP survives only as a coarse anomaly signal. The per-tenant cap remains as budget protection — one abused tenant must not consume the whole ingestion spend.
 - **`write:events` means exactly that.** No reads, no enumeration, no cross-tenant. The worst case of a fully abused pipeline is cost plus data pollution, never exfiltration — which is also the PDP Law argument, since a stolen write token cannot reach *data spesifik*.
+- **Stored tenant identity comes only from the verified `tenant_id` claim.** The envelope has no tenant field (§3.1); one appearing in a request body is rejected as unknown, never preferred over the claim. Otherwise a valid token for tenant A could write rows labelled tenant B.
+- **`event_id` stays client-generated.** The server stamps `ts`, `ts_received`, `trust_tier`, and `install_id` — it does not mint an event ID. The client's stable UUID v7 is the idempotency key (ADR-0004); a per-attempt server ID would make every retry a distinct row and break read-time dedup. Uniqueness scope is `(tenant_id, event_id)`; retrying an accepted event returns the same ID in `accepted`.
 - **Rotation is not an abuse control.** Rotating an embedded identifier costs a release and a forced-upgrade cycle — weeks. It is an incident-response lever only. The token is the thing that expires.
 
-This replaces the earlier `Authorization: Bearer wk_live_...` scheme in §3.2; the existing write key becomes the bootstrap client ID.
+**Legacy cutover.** This replaces the `Authorization: Bearer wk_live_...` scheme in §3.2, and the existing write key becomes the bootstrap `client_id`. It must stop being accepted as an ingest bearer credential — otherwise a leaked key bypasses the token lifetime and the change buys nothing. Because the SDK can't be force-upgraded, this is staged: dual-accept both credentials while logging legacy use per tenant and SDK version → a bounded deprecation window where legacy keys work but are rate-limited below Tier 1 → cutoff, where ingest returns `401` and only the exchange endpoint still accepts the value. The cutoff is a per-tenant config flag rather than a deploy, so a stranded customer can be rolled back to dual-accept without a release.
 
 ---
 
@@ -423,7 +438,7 @@ CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 
 `Tracker.track(name, props)` builds the event, does one `INSERT`, and returns. Three non-negotiable properties:
 
-- **Never blocks the caller meaningfully.** `track()` awaits the WAL insert (`synchronous=NORMAL`, sub-millisecond) — that await is the commit point and the durability boundary: the call returns once the row exists on disk, not before.
+- **Never blocks the caller meaningfully.** `track()` awaits the WAL insert (`synchronous=NORMAL`, sub-millisecond) — that await is the commit point: the call returns once the row is committed, not before. **Durability boundary is application crash, not power loss:** `synchronous=NORMAL` in WAL mode keeps the database consistent across a power cut but can roll back the most recent commits, so captures in the seconds before a hard reboot or kernel panic can be lost. A process crash loses nothing. `synchronous=FULL` would close this at the cost of an fsync per captured event — real battery and latency cost inside someone else's app — so the narrow window is accepted deliberately and counted in the loss boundaries below, not glossed as "durable".
 - **Never throws into host app code.** A telemetry SDK that can crash the app it measures is a liability. A failed insert (disk full, mid-migration) is caught inside `track()`, counted in `counters.write_failures`, and swallowed — the event is genuinely lost in that case, since there is no durable fallback to fall back to, but the loss is visible via the counter, not silent.
 - **No in-memory buffer.** An accumulator flushed every ~200ms would save a few fsyncs and create a window where a crash loses the events that most need capturing — the ones right before the crash. WAL mode makes immediate writes cheap enough that the buffer earns nothing.
 
@@ -496,8 +511,9 @@ An opt-in `optimistic: true` mode is available, which surfaces the pending count
 | Partial failure | Per-event accept/reject in a `200`. No poison pills. |
 | Backpressure | `429` + `Retry-After`; client backoff with jitter. |
 | Overload shedding | Per-tenant Redis quota → `429`. Client holds the data. |
-| Crash safety | `inflight` persisted; reset to `pending` on init. |
-| Bounded loss | Outbox capped at 10k; oldest dropped, counted, and reported. |
+| Crash safety | `inflight` persisted; reset to `pending` on init and at each flush cycle. |
+| Bounded loss | Four boundaries, all counted and reported, none silent: **(1)** outbox capped at 10k — oldest `pending` evicted, or the incoming capture dropped if all rows are `inflight`; **(2)** retry exhaustion (20 attempts, ~1.5h) marks an event `dead`; **(3)** capture-time SQLite write failure (disk full, mid-migration) — counted in `write_failures`; **(4)** power loss or kernel panic within seconds of capture, per `synchronous=NORMAL` (§4.2). |
+| Loss observability | `dropped_events` and `write_failures` ship as `sdk_dropped_events` on the next successful batch, and are also exposed on the SDK's diagnostics API for host apps that surface their own health. A device that never syncs again reports neither — that residual blind spot is inherent to client-side counters. |
 | Read consistency | Server-authoritative, read-through cache with etag + TTL. |
 | Contract safety | Protobuf source of truth, `buf breaking` in CI, golden fixtures shared by Go and Dart tests. |
 
