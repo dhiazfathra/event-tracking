@@ -38,7 +38,9 @@ Copied verbatim from the spec. Every task's requirements implicitly include this
 | `pkg/querydsl/etag.go` | Deterministic etag over the query spec + result |
 | `services/query/internal/execute/execute.go` | Run the compiled query, scan into `Series` |
 | `services/query/internal/handler/timeseries.go` | `POST /v1/query/timeseries` |
-| `services/query/internal/auth/readkey.go` | Read-key → tenant resolution with cache |
+| `services/query/internal/auth/readkey.go` | Read-key → tenant resolution, Postgres lookup + cache |
+| `migrations/postgres/0002_query_profiles.sql` | Per-tenant resource envelope |
+| `deploy/query.Dockerfile` | Build image for the compose stack |
 | `services/query/cmd/main.go` | Wiring |
 
 ---
@@ -312,6 +314,46 @@ func TestGroupByAndFilterCaps(t *testing.T) {
 	})
 }
 
+// filterClause binds vals[0] for scalar operators, so a second value would
+// silently widen the result set.
+func TestScalarOperatorsRequireExactlyOneValue(t *testing.T) {
+	for _, op := range []trackingv1.Op{
+		trackingv1.Op_OP_EQ, trackingv1.Op_OP_NEQ, trackingv1.Op_OP_GT, trackingv1.Op_OP_LT,
+	} {
+		t.Run(op.String(), func(t *testing.T) {
+			req := base()
+			req.Filters = []*trackingv1.Filter{{Field: "os", Op: op, Values: []string{"ios", "android"}}}
+			if err := querydsl.Validate(req); !errors.Is(err, querydsl.ErrTooManyValues) {
+				t.Errorf("err = %v, want ErrTooManyValues", err)
+			}
+		})
+	}
+
+	// IN is the one operator that legitimately takes several.
+	req := base()
+	req.Filters = []*trackingv1.Filter{{Field: "os", Op: trackingv1.Op_OP_IN, Values: []string{"ios", "android"}}}
+	if err := querydsl.Validate(req); err != nil {
+		t.Errorf("OP_IN with two values rejected: %v", err)
+	}
+}
+
+// An unspecified interval must not become a daily query by default.
+func TestUnsupportedIntervalRejected(t *testing.T) {
+	req := base()
+	req.Interval = trackingv1.Interval_INTERVAL_UNSPECIFIED
+	if err := querydsl.Validate(req); !errors.Is(err, querydsl.ErrBadInterval) {
+		t.Errorf("err = %v, want ErrBadInterval", err)
+	}
+}
+
+func TestUnsupportedMetricRejected(t *testing.T) {
+	req := base()
+	req.Metric = trackingv1.Metric_METRIC_UNSPECIFIED
+	if err := querydsl.Validate(req); !errors.Is(err, querydsl.ErrBadMetric) {
+		t.Errorf("err = %v, want ErrBadMetric", err)
+	}
+}
+
 func TestEmptyEventNameRejected(t *testing.T) {
 	req := base()
 	req.EventName = ""
@@ -368,6 +410,9 @@ var (
 	ErrUnknownEventName = errors.New("querydsl: event_name is required")
 	ErrBadOp            = errors.New("querydsl: unsupported operator")
 	ErrEmptyValues      = errors.New("querydsl: filter has no values")
+	ErrTooManyValues    = errors.New("querydsl: scalar operator takes exactly one value")
+	ErrBadInterval      = errors.New("querydsl: unsupported interval")
+	ErrBadMetric        = errors.New("querydsl: unsupported metric")
 )
 
 const (
@@ -464,6 +509,23 @@ func Validate(req *trackingv1.TimeseriesRequest) error {
 			return fmt.Errorf("%w: group_by %q", ErrUnknownField, g)
 		}
 	}
+	// A silently dropped interval is a wrong answer wearing a 200. Reject the
+	// unspecified enum rather than letting the compiler's default turn it into
+	// a daily query the caller never asked for.
+	switch req.GetInterval() {
+	case trackingv1.Interval_INTERVAL_HOUR,
+		trackingv1.Interval_INTERVAL_DAY,
+		trackingv1.Interval_INTERVAL_WEEK:
+	default:
+		return fmt.Errorf("%w: %v", ErrBadInterval, req.GetInterval())
+	}
+
+	switch req.GetMetric() {
+	case trackingv1.Metric_METRIC_EVENTS, trackingv1.Metric_METRIC_USERS:
+	default:
+		return fmt.Errorf("%w: %v", ErrBadMetric, req.GetMetric())
+	}
+
 	for _, f := range req.GetFilters() {
 		if _, ok := Column(f.GetField()); !ok {
 			return fmt.Errorf("%w: filter %q", ErrUnknownField, f.GetField())
@@ -472,8 +534,16 @@ func Validate(req *trackingv1.TimeseriesRequest) error {
 			return fmt.Errorf("%w: %q", ErrEmptyValues, f.GetField())
 		}
 		switch f.GetOp() {
-		case trackingv1.Op_OP_EQ, trackingv1.Op_OP_NEQ, trackingv1.Op_OP_IN,
-			trackingv1.Op_OP_GT, trackingv1.Op_OP_LT:
+		case trackingv1.Op_OP_IN:
+			// Already covered by the non-empty check above.
+		case trackingv1.Op_OP_EQ, trackingv1.Op_OP_NEQ, trackingv1.Op_OP_GT, trackingv1.Op_OP_LT:
+			// Scalar operators compile to a single bound parameter, so a second
+			// value would be dropped without a word — the caller would get a
+			// broader result set than the one they asked for.
+			if len(f.GetValues()) != 1 {
+				return fmt.Errorf("%w: %q takes exactly one value, got %d",
+					ErrTooManyValues, f.GetField(), len(f.GetValues()))
+			}
 		default:
 			return fmt.Errorf("%w: %v", ErrBadOp, f.GetOp())
 		}
@@ -724,7 +794,10 @@ func compileRaw(tenantID string, req *trackingv1.TimeseriesRequest) (Compiled, e
 	if err != nil {
 		return Compiled{}, err
 	}
-	bucket := bucketExpr(req.GetInterval())
+	bucket, err := bucketExpr(req.GetInterval())
+	if err != nil {
+		return Compiled{}, err
+	}
 
 	selects := []string{bucket + " AS bucket"}
 	groups := []string{"bucket"}
@@ -751,10 +824,17 @@ func compileRaw(tenantID string, req *trackingv1.TimeseriesRequest) (Compiled, e
 	}
 
 	// No FINAL. Dedup is uniqExact at the metric, not a query-time merge.
+	//
+	// ORDER BY covers every grouping column, not just bucket. ClickHouse makes
+	// no promise about the order of groups within a bucket, and the scan builds
+	// series in first-seen order — so ordering by bucket alone lets one result
+	// come back with its series in a different order run to run, which changes
+	// the ETag and defeats revalidation for a result that never changed.
 	sql := fmt.Sprintf(
-		"SELECT %s\nFROM events\nWHERE %s\nGROUP BY %s\nORDER BY bucket",
+		"SELECT %s\nFROM events\nWHERE %s\nGROUP BY %s\nORDER BY %s",
 		strings.Join(selects, ", "),
 		strings.Join(where, "\n  AND "),
+		strings.Join(groups, ", "),
 		strings.Join(groups, ", "),
 	)
 
@@ -821,14 +901,19 @@ func metricExpr(req *trackingv1.TimeseriesRequest) (string, error) {
 	}
 }
 
-func bucketExpr(iv trackingv1.Interval) string {
+// bucketExpr assumes Validate has already rejected unsupported intervals. The
+// default arm is unreachable and returns an error rather than quietly bucketing
+// by day.
+func bucketExpr(iv trackingv1.Interval) (string, error) {
 	switch iv {
 	case trackingv1.Interval_INTERVAL_HOUR:
-		return "toStartOfHour(ts)"
+		return "toStartOfHour(ts)", nil
+	case trackingv1.Interval_INTERVAL_DAY:
+		return "toStartOfDay(ts)", nil
 	case trackingv1.Interval_INTERVAL_WEEK:
-		return "toStartOfWeek(ts)"
+		return "toStartOfWeek(ts)", nil
 	default:
-		return "toStartOfDay(ts)"
+		return "", fmt.Errorf("%w: %v", ErrBadInterval, iv)
 	}
 }
 
@@ -893,7 +978,8 @@ git commit -m "feat(querydsl): compile DSL to parameterized SQL with server-inje
 - Consumes: `trackingv1.TimeseriesRequest`.
 - Produces:
   - `func UseRollup(req *trackingv1.TimeseriesRequest) bool`
-  - `func ETag(tenantID string, req *trackingv1.TimeseriesRequest, computedAt time.Time, body []byte) string`
+  - `func ETag(tenantID string, req *trackingv1.TimeseriesRequest, content []byte) string`
+  - `func ETagContent(series []*trackingv1.Series, source string, approximate bool) ([]byte, error)`
   - `const RollupMinRangeDays = 30`
 
 - [ ] **Step 1: Write the failing test**
@@ -949,25 +1035,108 @@ func TestRollupOnlyForCoarseLongRangeQueries(t *testing.T) {
 	}
 }
 
+// events_daily stores whole UTC days and the rollup query rounds both bounds
+// with toDate(). A midday-to-midday range would come back covering more than
+// was asked for.
+func TestUnalignedRangesDoNotRouteToRollup(t *testing.T) {
+	midday := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	midnight := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	unaligned := &trackingv1.TimeseriesRequest{
+		EventName: "e",
+		FromMs:    midday.UnixMilli(),
+		ToMs:      midday.Add(90 * 24 * time.Hour).UnixMilli(),
+		Interval:  trackingv1.Interval_INTERVAL_DAY,
+		Metric:    trackingv1.Metric_METRIC_EVENTS,
+	}
+	if querydsl.UseRollup(unaligned) {
+		t.Error("a midday-aligned range routed to the date-only rollup")
+	}
+
+	aligned := &trackingv1.TimeseriesRequest{
+		EventName: "e",
+		FromMs:    midnight.UnixMilli(),
+		ToMs:      midnight.Add(90 * 24 * time.Hour).UnixMilli(),
+		Interval:  trackingv1.Interval_INTERVAL_DAY,
+		Metric:    trackingv1.Metric_METRIC_EVENTS,
+	}
+	if !querydsl.UseRollup(aligned) {
+		t.Error("a midnight-aligned 90-day range did not route to the rollup")
+	}
+}
+
+// Series order must be a function of the data, not of ClickHouse's scan order —
+// otherwise the same result yields a different ETag run to run.
+func TestGroupedQueryOrdersByGroupColumns(t *testing.T) {
+	from := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	c, err := querydsl.Compile("t1", &trackingv1.TimeseriesRequest{
+		EventName: "e", FromMs: from.UnixMilli(), ToMs: from.Add(24 * time.Hour).UnixMilli(),
+		Interval: trackingv1.Interval_INTERVAL_DAY, Metric: trackingv1.Metric_METRIC_EVENTS,
+		GroupBy: []string{"os", "locale"},
+	}, false)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !strings.Contains(c.SQL, "ORDER BY bucket, os, locale") {
+		t.Errorf("ORDER BY does not cover the group columns:\n%s", c.SQL)
+	}
+}
+
 func TestETagIsStableAndSpecSensitive(t *testing.T) {
 	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	req := &trackingv1.TimeseriesRequest{EventName: "e", FromMs: from.UnixMilli(), ToMs: from.Add(24 * time.Hour).UnixMilli(), Interval: trackingv1.Interval_INTERVAL_DAY, Metric: trackingv1.Metric_METRIC_EVENTS}
-	at := time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC)
-	body := []byte(`{"series":[]}`)
 
-	a := querydsl.ETag("t1", req, at, body)
-	b := querydsl.ETag("t1", req, at, body)
-	if a != b {
+	content, err := querydsl.ETagContent(nil, "raw", false)
+	if err != nil {
+		t.Fatalf("content: %v", err)
+	}
+
+	a := querydsl.ETag("t1", req, content)
+	if b := querydsl.ETag("t1", req, content); a != b {
 		t.Errorf("etag not stable: %q vs %q", a, b)
 	}
 
 	// A different tenant must never collide — a shared etag across tenants
 	// would let one tenant's 304 serve another's cached body.
-	if querydsl.ETag("t2", req, at, body) == a {
+	if querydsl.ETag("t2", req, content) == a {
 		t.Error("etag collides across tenants")
 	}
-	if querydsl.ETag("t1", req, at, []byte(`{"series":[{"points":[]}]}`)) == a {
-		t.Error("etag unchanged when the body changed")
+
+	changed, _ := querydsl.ETagContent([]*trackingv1.Series{{
+		Points: []*trackingv1.Point{{BucketMs: 1, Value: 1}},
+	}}, "raw", false)
+	if querydsl.ETag("t1", req, changed) == a {
+		t.Error("etag unchanged when the content changed")
+	}
+}
+
+// The whole point of the validator: an unchanged result must produce the same
+// ETag at two different computation times, or If-None-Match can never match and
+// the 304 path is unreachable.
+func TestETagIgnoresComputationTime(t *testing.T) {
+	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	req := &trackingv1.TimeseriesRequest{EventName: "e", FromMs: from.UnixMilli(), ToMs: from.Add(24 * time.Hour).UnixMilli(), Interval: trackingv1.Interval_INTERVAL_DAY, Metric: trackingv1.Metric_METRIC_EVENTS}
+
+	series := []*trackingv1.Series{{Points: []*trackingv1.Point{{BucketMs: 1, Value: 42}}}}
+	first, _ := querydsl.ETagContent(series, "raw", false)
+	second, _ := querydsl.ETagContent(series, "raw", false)
+
+	if querydsl.ETag("t1", req, first) != querydsl.ETag("t1", req, second) {
+		t.Error("identical content produced different etags")
+	}
+}
+
+// rollup-vs-raw is a material difference in what the number means, so it must
+// change the validator.
+func TestETagDistinguishesSourceAndApproximation(t *testing.T) {
+	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	req := &trackingv1.TimeseriesRequest{EventName: "e", FromMs: from.UnixMilli(), ToMs: from.Add(24 * time.Hour).UnixMilli(), Interval: trackingv1.Interval_INTERVAL_DAY, Metric: trackingv1.Metric_METRIC_EVENTS}
+
+	raw, _ := querydsl.ETagContent(nil, "raw", false)
+	rollup, _ := querydsl.ETagContent(nil, "rollup", true)
+
+	if querydsl.ETag("t1", req, raw) == querydsl.ETag("t1", req, rollup) {
+		t.Error("raw and rollup responses share an etag")
 	}
 }
 ```
@@ -1010,8 +1179,20 @@ func UseRollup(req *trackingv1.TimeseriesRequest) bool {
 	if len(req.GetGroupBy()) > 0 || len(req.GetFilters()) > 0 {
 		return false
 	}
-	span := time.UnixMilli(req.GetToMs()).Sub(time.UnixMilli(req.GetFromMs()))
-	return span >= RollupMinRangeDays*24*time.Hour
+
+	from := time.UnixMilli(req.GetFromMs()).UTC()
+	to := time.UnixMilli(req.GetToMs()).UTC()
+
+	// The rollup stores whole UTC days and the query rounds both bounds with
+	// toDate(). A range from midday Monday to midday Friday would silently
+	// become Monday 00:00 to Friday 00:00 — quietly answering a different
+	// question than the one asked. Only exactly-aligned ranges may route here;
+	// everything else goes to raw, where ts is compared directly.
+	if !from.Equal(from.Truncate(24*time.Hour)) || !to.Equal(to.Truncate(24*time.Hour)) {
+		return false
+	}
+
+	return to.Sub(from) >= RollupMinRangeDays*24*time.Hour
 }
 ```
 
@@ -1022,22 +1203,25 @@ package querydsl
 
 import (
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
-	"time"
 
 	"google.golang.org/protobuf/proto"
 
 	trackingv1 "github.com/dhiazfathra/event-tracking/gen/go/tracking/v1"
 )
 
-// ETag is a strong validator over (tenant, query spec, computation time, body).
+// ETag is a strong validator over (tenant, query spec, result content).
+//
+// Deliberately NOT over computedAt. Folding the computation time in would make
+// every response a fresh validator, so If-None-Match could never match and the
+// 304 path would be dead code. Freshness travels in the response's own
+// computed_at field; the ETag answers only "is the content the same".
 //
 // tenant_id is hashed in even though a client can only ever see its own etags:
 // an etag that collided across tenants would let one tenant's If-None-Match
 // produce a 304 against another's cached body if a shared cache were ever put
 // in front of this service.
-func ETag(tenantID string, req *trackingv1.TimeseriesRequest, computedAt time.Time, body []byte) string {
+func ETag(tenantID string, req *trackingv1.TimeseriesRequest, content []byte) string {
 	h := sha256.New()
 	h.Write([]byte(tenantID))
 	h.Write([]byte{0})
@@ -1049,14 +1233,24 @@ func ETag(tenantID string, req *trackingv1.TimeseriesRequest, computedAt time.Ti
 		h.Write(spec)
 	}
 	h.Write([]byte{0})
-
-	var ts [8]byte
-	binary.BigEndian.PutUint64(ts[:], uint64(computedAt.UnixMilli()))
-	h.Write(ts[:])
-	h.Write([]byte{0})
-	h.Write(body)
+	h.Write(content)
 
 	return `"` + hex.EncodeToString(h.Sum(nil)[:16]) + `"`
+}
+
+// ETagContent is the canonical byte form the validator hashes: the parts of the
+// response that are actually a function of the query, with computed_at and the
+// etag itself excluded.
+//
+// Both the handler and the If-None-Match comparison must go through this, or
+// they hash different bytes and no revalidation ever succeeds.
+func ETagContent(series []*trackingv1.Series, source string, approximate bool) ([]byte, error) {
+	stable := &trackingv1.TimeseriesResponse{
+		Series:      series,
+		Source:      source,
+		Approximate: approximate,
+	}
+	return proto.MarshalOptions{Deterministic: true}.Marshal(stable)
 }
 ```
 
@@ -1258,22 +1452,46 @@ import (
 // cluster.
 type Settings struct {
 	MaxExecutionTime int   // seconds
-	MaxMemoryUsage   int64 // bytes; 0 = server default
-	MaxRowsToRead    int64 // 0 = unlimited
+	MaxMemoryUsage   int64 // bytes
+	MaxRowsToRead    int64
 }
 
+// Ceilings applied when a per-tenant profile is missing, zero, or larger than
+// the platform is willing to serve.
+//
+// Failing open here would undo the point of the DSL: a bounded query language
+// buys nothing if a malformed or absent read-key profile lets a compiled query
+// run unbounded and eat the cluster.
+const (
+	maxExecutionTimeCeiling = 30            // seconds
+	maxMemoryUsageCeiling   = 4 << 30       // 4 GiB
+	maxRowsToReadCeiling    = 5_000_000_000 // ~2 months of raw events
+)
+
+// clamp fills in zero values with the ceiling and caps anything above it. A
+// tenant profile can be more restrictive than the platform default, never less.
+func (s Settings) clamp() Settings {
+	if s.MaxExecutionTime <= 0 || s.MaxExecutionTime > maxExecutionTimeCeiling {
+		s.MaxExecutionTime = maxExecutionTimeCeiling
+	}
+	if s.MaxMemoryUsage <= 0 || s.MaxMemoryUsage > maxMemoryUsageCeiling {
+		s.MaxMemoryUsage = maxMemoryUsageCeiling
+	}
+	if s.MaxRowsToRead <= 0 || s.MaxRowsToRead > maxRowsToReadCeiling {
+		s.MaxRowsToRead = maxRowsToReadCeiling
+	}
+	return s
+}
+
+// apply always sets all three. Omitting one would defer to the server default,
+// which for max_rows_to_read is unlimited.
 func (s Settings) apply(ctx context.Context) context.Context {
-	set := clickhouse.Settings{}
-	if s.MaxExecutionTime > 0 {
-		set["max_execution_time"] = s.MaxExecutionTime
-	}
-	if s.MaxMemoryUsage > 0 {
-		set["max_memory_usage"] = s.MaxMemoryUsage
-	}
-	if s.MaxRowsToRead > 0 {
-		set["max_rows_to_read"] = s.MaxRowsToRead
-	}
-	return clickhouse.Context(ctx, clickhouse.WithSettings(set))
+	s = s.clamp()
+	return clickhouse.Context(ctx, clickhouse.WithSettings(clickhouse.Settings{
+		"max_execution_time": s.MaxExecutionTime,
+		"max_memory_usage":   s.MaxMemoryUsage,
+		"max_rows_to_read":   s.MaxRowsToRead,
+	}))
 }
 
 // Run executes the compiled query. groupBy names the extra columns the compiler
@@ -1334,12 +1552,18 @@ func Run(ctx context.Context, conn driver.Conn, c querydsl.Compiled, groupBy []s
 	return order, nil
 }
 
+// seriesKey length-prefixes each label (add `strconv` and `strings` to the
+// imports). Plain NUL-delimited concatenation
+// collides: ["a\x00", "b"] and ["a", "\x00b"] produce identical keys, silently
+// merging two distinct groups into one series.
 func seriesKey(labels []string) string {
-	key := ""
+	var b strings.Builder
 	for _, l := range labels {
-		key += l + "\x00"
+		b.WriteString(strconv.Itoa(len(l)))
+		b.WriteByte(':')
+		b.WriteString(l)
 	}
-	return key
+	return b.String()
 }
 ```
 
@@ -1368,6 +1592,7 @@ git commit -m "feat(query): execute compiled queries under a bounded settings pr
 - Consumes: `querydsl.*`, `execute.Run`.
 - Produces:
   - `type Resolver interface { Tenant(ctx context.Context, key string) (string, execute.Settings, error) }`
+  - `func auth.NewPostgresLookup(pool *pgxpool.Pool) auth.Lookup`
   - `type Deps struct { Resolver Resolver; Query func(ctx context.Context, c querydsl.Compiled, groupBy []string, s execute.Settings) ([]*trackingv1.Series, error); Now func() time.Time }`
   - `func NewTimeseries(d Deps) http.Handler`
 
@@ -1477,6 +1702,64 @@ func TestMissingReadKeyReturns401(t *testing.T) {
 		t.Errorf("status = %d, want 401", rec.Code)
 	}
 }
+
+// A misspelled field must not be dropped: the caller would get a broader result
+// than they asked for and no indication anything went wrong.
+func TestUnknownJSONFieldReturns400(t *testing.T) {
+	h, _ := newTimeseriesHandler(t)
+	rec := postJSON(t, h, "/v1/query/timeseries", `{
+		"eventName":"checkout","fromMs":"1751328000000","toMs":"1751932800000",
+		"interval":"INTERVAL_DAY","metric":"METRIC_EVENTS","filtres":[]}`, "rk_test")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for a misspelled field", rec.Code)
+	}
+}
+
+// LimitReader would accept a valid object followed by arbitrary trailing bytes.
+func TestOversizedRequestReturns413(t *testing.T) {
+	h, _ := newTimeseriesHandler(t)
+	padding := strings.Repeat("x", 128<<10)
+	body := `{"eventName":"checkout","fromMs":"1751328000000","toMs":"1751932800000",` +
+		`"interval":"INTERVAL_DAY","metric":"METRIC_EVENTS"}` + padding
+
+	rec := postJSON(t, h, "/v1/query/timeseries", body, "rk_test")
+	if rec.Code != http.StatusRequestEntityTooLarge && rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 413 (or 400), never 200", rec.Code)
+	}
+	if rec.Code == http.StatusOK {
+		t.Error("trailing garbage past the size limit was accepted")
+	}
+}
+
+// A shared cache keying on the POST URL alone would otherwise be able to serve
+// one tenant's body to another.
+func TestResponseIsNotSharedCacheable(t *testing.T) {
+	h, _ := newTimeseriesHandler(t)
+	rec := postJSON(t, h, "/v1/query/timeseries", `{
+		"eventName":"checkout","fromMs":"1751328000000","toMs":"1751932800000",
+		"interval":"INTERVAL_DAY","metric":"METRIC_EVENTS"}`, "rk_test")
+
+	if cc := rec.Header().Get("Cache-Control"); !strings.Contains(cc, "private") && !strings.Contains(cc, "no-store") {
+		t.Errorf("Cache-Control = %q, want private/no-store", cc)
+	}
+	if v := rec.Header().Get("Vary"); !strings.Contains(v, "Authorization") {
+		t.Errorf("Vary = %q, want it to include Authorization", v)
+	}
+}
+
+// A scalar filter with two values must not silently drop one.
+func TestScalarFilterWithTwoValuesReturns400(t *testing.T) {
+	h, _ := newTimeseriesHandler(t)
+	rec := postJSON(t, h, "/v1/query/timeseries", `{
+		"eventName":"checkout","fromMs":"1751328000000","toMs":"1751932800000",
+		"interval":"INTERVAL_DAY","metric":"METRIC_EVENTS",
+		"filters":[{"field":"os","op":"OP_EQ","values":["ios","android"]}]}`, "rk_test")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1563,7 +1846,57 @@ func (c *Cache) Tenant(ctx context.Context, key string) (string, execute.Setting
 
 	return entry.TenantID, entry.Settings, nil
 }
+
+// NewPostgresLookup is the concrete read-key resolver.
+//
+// Read keys are stored hashed — the plaintext key is never persisted, so a
+// control-plane database dump does not hand over working credentials. Revoked
+// keys are excluded here rather than filtered later, so a revoked key resolves
+// to ErrUnknownKey and produces a 401 instead of a tenant.
+func NewPostgresLookup(pool *pgxpool.Pool) Lookup {
+	return func(ctx context.Context, keyHash [32]byte) (Entry, error) {
+		var e Entry
+		err := pool.QueryRow(ctx, `
+			SELECT r.tenant_id,
+			       COALESCE(q.max_execution_time, 0),
+			       COALESCE(q.max_memory_usage, 0),
+			       COALESCE(q.max_rows_to_read, 0)
+			FROM read_keys r
+			LEFT JOIN query_profiles q USING (tenant_id)
+			WHERE r.key_hash = $1 AND r.revoked_at IS NULL`,
+			keyHash[:],
+		).Scan(&e.TenantID,
+			&e.Settings.MaxExecutionTime,
+			&e.Settings.MaxMemoryUsage,
+			&e.Settings.MaxRowsToRead)
+
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Entry{}, ErrUnknownKey
+		}
+		if err != nil {
+			return Entry{}, fmt.Errorf("resolve read key: %w", err)
+		}
+		// Zero values are fine: execute.Settings.clamp() substitutes the
+		// platform ceiling, so a tenant with no profile row still runs bounded.
+		return e, nil
+	}
+}
 ```
+
+Add the per-tenant query profile table in
+`migrations/postgres/0002_query_profiles.sql`:
+
+```sql
+CREATE TABLE query_profiles (
+    tenant_id          TEXT PRIMARY KEY REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    max_execution_time INTEGER NOT NULL DEFAULT 30,
+    max_memory_usage   BIGINT  NOT NULL DEFAULT 4294967296,
+    max_rows_to_read   BIGINT  NOT NULL DEFAULT 5000000000
+);
+```
+
+A tenant with no row here is not unbounded — `clamp()` applies the platform
+ceiling. The table exists to make a tenant *more* restricted, never less.
 
 - [ ] **Step 4: Write the handler**
 
@@ -1612,14 +1945,26 @@ func NewTimeseries(d Deps) http.Handler {
 			return
 		}
 
-		raw, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBytes))
+		// MaxBytesReader, not LimitReader: LimitReader truncates silently, so a
+		// valid JSON object in the first 64 KiB followed by arbitrary bytes
+		// would be accepted as if the trailing garbage were not there.
+		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
 		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				httpError(w, http.StatusRequestEntityTooLarge, "query too large")
+				return
+			}
 			httpError(w, http.StatusBadRequest, "unreadable body")
 			return
 		}
 
 		var req trackingv1.TimeseriesRequest
-		if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(raw, &req); err != nil {
+		// Strict decoding. DiscardUnknown would drop a misspelled filter field
+		// and answer 200 with a broader result set than the caller intended —
+		// the worst kind of failure for an analytics API, because the number
+		// looks fine.
+		if err := protojson.Unmarshal(raw, &req); err != nil {
 			httpError(w, http.StatusBadRequest, "malformed query")
 			return
 		}
@@ -1640,35 +1985,42 @@ func NewTimeseries(d Deps) http.Handler {
 			return
 		}
 
-		computedAt := d.Now()
-		resp := &trackingv1.TimeseriesResponse{
-			Series:      series,
-			Source:      compiled.Source,
-			Approximate: req.GetApproximate() || compiled.Source == "rollup",
-			ComputedAt:  computedAt.UnixMilli(),
-		}
+		approximate := req.GetApproximate() || compiled.Source == "rollup"
 
-		body, err := protojson.Marshal(resp)
+		// One ETag, computed once, over content only — used for the header, the
+		// body, and the If-None-Match comparison. Computing it twice from
+		// different bytes is how the 304 path ends up unreachable.
+		content, err := querydsl.ETagContent(series, compiled.Source, approximate)
 		if err != nil {
 			httpError(w, http.StatusInternalServerError, "encode")
 			return
 		}
-
-		etag := querydsl.ETag(tenantID, &req, computedAt, body)
-		resp.Etag = etag
-
-		// Re-marshal with the etag embedded so the body and the header agree.
-		body, err = protojson.Marshal(resp)
-		if err != nil {
-			httpError(w, http.StatusInternalServerError, "encode")
-			return
-		}
+		etag := querydsl.ETag(tenantID, &req, content)
 
 		w.Header().Set("ETag", etag)
-		if match := r.Header.Get("If-None-Match"); match != "" && matches(match, etag, tenantID, &req, d, series) {
+		// The response is tenant-specific and this endpoint is a POST, which
+		// some intermediaries will happily key on URL alone. Say so explicitly
+		// rather than relying on the ETag to keep tenants apart in a shared
+		// cache.
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.Header().Set("Vary", "Authorization")
+
+		if r.Header.Get("If-None-Match") == etag {
 			// The client's cached body is still correct. 304 refreshes its TTL
 			// with no transfer.
 			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+
+		body, err := protojson.Marshal(&trackingv1.TimeseriesResponse{
+			Series:      series,
+			Source:      compiled.Source,
+			Approximate: approximate,
+			ComputedAt:  d.Now().UnixMilli(),
+			Etag:        etag,
+		})
+		if err != nil {
+			httpError(w, http.StatusInternalServerError, "encode")
 			return
 		}
 
@@ -1676,31 +2028,6 @@ func NewTimeseries(d Deps) http.Handler {
 		_, _ = w.Write(body)
 	})
 }
-
-// matches compares the client's validator against an etag computed over the
-// same query spec and result body but the client's own computed_at, so an
-// unchanged result revalidates even though this request has a newer timestamp.
-func matches(clientETag, _ string, tenantID string, req *trackingv1.TimeseriesRequest, d Deps, series []*trackingv1.Series) bool {
-	// Recompute the content etag with computed_at zeroed: freshness is carried
-	// by the response's own computed_at field, not by the validator. Folding
-	// the timestamp into the validator would make every response a cache miss.
-	stable := &trackingv1.TimeseriesResponse{Series: series}
-	body, err := protojson.Marshal(stable)
-	if err != nil {
-		return false
-	}
-	return clientETag == querydsl.ETag(tenantID, req, time.Time{}, body)
-}
-
-// Rewrite the etag used above to the content-stable form so header, body, and
-// comparison all agree. Replace the ETag(...) call in the handler with:
-//
-//	stable := &trackingv1.TimeseriesResponse{Series: series}
-//	stableBody, _ := protojson.Marshal(stable)
-//	etag := querydsl.ETag(tenantID, &req, time.Time{}, stableBody)
-//
-// computed_at then reports freshness without invalidating the cache on every
-// request.
 
 func bearer(r *http.Request) string {
 	const p = "Bearer "
@@ -1735,9 +2062,9 @@ func httpError(w http.ResponseWriter, code int, msg string) {
 }
 ```
 
-Apply the rewrite the comment describes before running the tests: compute
-`etag` once from the content-stable body, use it for the header, the body, and
-the `If-None-Match` comparison, and delete the explanatory comment block.
+Add `userFacing` cases for `ErrTooManyValues`, `ErrBadInterval`, and
+`ErrBadMetric` so those come back as specific 400 messages rather than the
+generic "invalid query".
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -1757,12 +2084,41 @@ git commit -m "feat(query): timeseries endpoint with etag revalidation and rollu
 
 **Files:**
 - Create: `services/query/cmd/main.go`
+- Create: `deploy/query.Dockerfile`
 - Create: `services/query/README.md`
+- Modify: `migrations/postgres/0002_query_profiles.sql` (from Task 6)
 - Modify: `deploy/docker-compose.yml`
 - Modify: `.github/workflows/ci.yml`
 - Modify: `README.md`
 
-- [ ] **Step 1: Write `main.go`**
+- [ ] **Step 1: Write the Dockerfile**
+
+`deploy/query.Dockerfile`. The compose entry below builds from it, so without
+this file `docker compose build query` fails on a clean checkout:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+
+COPY go.work go.work.sum* ./
+COPY gen/ gen/
+COPY pkg/ pkg/
+COPY services/ services/
+COPY tools/ tools/
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/query ./services/query/cmd
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/query /query
+USER nonroot:nonroot
+EXPOSE 8081
+ENTRYPOINT ["/query"]
+```
+
+- [ ] **Step 2: Write `main.go`**
 
 `services/query/cmd/main.go`:
 
@@ -1811,9 +2167,16 @@ func main() {
 	}
 	defer conn.Close()
 
+	pool, err := controlplane.Open(ctx, env("POSTGRES_DSN", "postgres://postgres:dev@localhost:5432/control"))
+	if err != nil {
+		log.Error("postgres", "err", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
 	// Short TTL rather than an invalidation channel: revocation is bounded by
 	// the TTL and the control plane stays a single table read.
-	resolver := auth.NewCache(pgLookupReadKey(ctx), time.Minute)
+	resolver := auth.NewCache(auth.NewPostgresLookup(pool), time.Minute)
 
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/query/timeseries", handler.NewTimeseries(handler.Deps{
@@ -1828,7 +2191,12 @@ func main() {
 		Addr:              env("LISTEN_ADDR", ":8081"),
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      60 * time.Second,
+		// ReadHeaderTimeout does not bound the body. A query body is at most
+		// 64 KiB, so anything slower than this is a client holding a connection
+		// open, not a legitimate dashboard request.
+		ReadTimeout:  15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+		WriteTimeout: 60 * time.Second,
 	}
 
 	go func() {
@@ -1854,9 +2222,11 @@ func env(k, def string) string {
 }
 ```
 
-- [ ] **Step 2: Add the service to compose and CI**
+- [ ] **Step 3: Add the service to compose and CI**
 
-Append to `deploy/docker-compose.yml`:
+Append to `deploy/docker-compose.yml`. `service_healthy`, not bare
+`depends_on` — the latter only orders container start, so the query service
+would race ClickHouse's first boot:
 
 ```yaml
   query:
@@ -1865,9 +2235,13 @@ Append to `deploy/docker-compose.yml`:
       dockerfile: deploy/query.Dockerfile
     environment:
       CLICKHOUSE_ADDRS: clickhouse:9000
+      CLICKHOUSE_DB: tracking
+      POSTGRES_DSN: postgres://postgres:dev@postgres:5432/control
       LISTEN_ADDR: ":8081"
     ports: ["8081:8081"]
-    depends_on: [clickhouse, postgres]
+    depends_on:
+      clickhouse: { condition: service_healthy }
+      postgres:   { condition: service_healthy }
 ```
 
 Append to `.github/workflows/ci.yml`:
@@ -1884,9 +2258,11 @@ Append to `.github/workflows/ci.yml`:
         run: cd pkg/querydsl && go test ./...
       - name: query service tests
         run: cd services/query && go test ./...
+      - name: Compose stack builds
+        run: docker compose -f deploy/docker-compose.yml build query
 ```
 
-- [ ] **Step 3: Write `services/query/README.md`**
+- [ ] **Step 4: Write `services/query/README.md`**
 
 ````markdown
 # Query Service
@@ -1938,12 +2314,28 @@ deliveries inflate rollup counts. Raw `events` is the only source of truth.
 ## Caching
 
 Responses carry an `ETag` and `computed_at`. The etag is computed over the
-tenant, the query spec, and the result body — **not** the computation time, so
-an unchanged result revalidates with a `304` and refreshes the client's TTL
-with no body transfer.
+tenant, the query spec, and the result content (`series`, `source`,
+`approximate`) — **not** the computation time or the etag field itself, so an
+unchanged result revalidates with a `304` and refreshes the client's TTL with no
+body transfer. Both the response header and the `If-None-Match` comparison go
+through `querydsl.ETagContent`; hashing different bytes on the two paths would
+make the `304` unreachable.
+
+Responses are `Cache-Control: private, no-store` with `Vary: Authorization`.
+They are tenant-specific, and an intermediary keying on the POST URL alone could
+otherwise serve one tenant's body to another.
 
 Server-pushed invalidation does not exist (spec §7.6). Freshness is
 `computed_at` plus pull-to-refresh.
+
+## Resource bounds
+
+Every query runs with `max_execution_time`, `max_memory_usage`, and
+`max_rows_to_read` explicitly set. A per-tenant `query_profiles` row can make a
+tenant *more* restricted; it can never lift the platform ceiling, and a missing
+or zero value falls back to the ceiling rather than to the ClickHouse default
+(which for `max_rows_to_read` is unlimited). A bounded query language buys
+nothing if a missing profile row lets a compiled query eat the cluster.
 
 ## Known gap
 
@@ -1978,6 +2370,16 @@ git commit -m "feat(query): wire the service, compose entry, CI job, and docs"
 - No emitted SQL contains `FINAL`.
 - `uniq()` is reachable only via `approximate: true`.
 - Rollup-backed responses are labelled `"source":"rollup"` and `"approximate":true`.
+- Only UTC-midnight-aligned ranges route to the rollup.
 - Duplicate deliveries do not inflate raw counts (integration test against a real ClickHouse).
 - A query for tenant A never returns tenant B's rows (integration test).
-- `304` on a matching `If-None-Match` with a zero-length body.
+- `304` on a matching `If-None-Match` with a zero-length body — the same ETag
+  comes back for identical content at two different computation times.
+- Grouped queries emit `ORDER BY` over every group column, so series order and
+  therefore the ETag are stable across runs.
+- An unspecified interval or metric, a scalar filter with two values, an unknown
+  JSON field, and an over-limit body are all rejected rather than coerced.
+- Every executed query carries non-zero `max_execution_time`,
+  `max_memory_usage`, and `max_rows_to_read`.
+- `docker compose -f deploy/docker-compose.yml build query` succeeds on a clean
+  checkout.

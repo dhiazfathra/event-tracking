@@ -338,7 +338,7 @@ test:
 
 Delete these three lines:
 
-```
+```gitignore
 # Go workspace file
 go.work
 go.work.sum
@@ -358,24 +358,34 @@ make gen
 
 - [ ] **Step 4: Write `go.work`**
 
-```
+**A committed `go.work` must list only modules whose `go.mod` already exists** —
+`go build ./...` fails outright on a `use` directive pointing at a directory
+with no module. At this point that is exactly one module:
+
+```go
 go 1.23
 
-use (
-	./gen/go
-	./pkg/limits
-	./pkg/testsupport
-)
+use ./gen/go
 ```
 
-Later plans append their own modules (`./services/ingest`, `./services/query`,
-`./pkg/clickhouse`, `./pkg/tenant`, `./pkg/querydsl`) as they are created.
+Each later task appends its own module in the same commit that creates the
+`go.mod`:
+
+| Task | Appends |
+|---|---|
+| Task 4 | `./pkg/limits`, `./pkg/testsupport` |
+| Task 6 | `./tools` |
+| Plan 2 | `./pkg/clickhouse`, `./pkg/tenant`, `./services/ingest` |
+| Plan 3 | `./pkg/querydsl`, `./services/query` |
+
+`./tools` matters more than it looks: the root `Makefile` runs
+`go run ./tools/checkboundaries`, which only resolves if `tools` is in the
+workspace.
 
 - [ ] **Step 5: Run the build to verify generated Go compiles**
 
 Run: `go build ./...`
-Expected: exit 0, no output. (`pkg/limits` and `pkg/testsupport` do not exist yet
-— create them in Task 4 and re-run; until then, list only `./gen/go` in `go.work`.)
+Expected: exit 0, no output.
 
 - [ ] **Step 6: Commit**
 
@@ -526,8 +536,18 @@ func LoadGolden(t *testing.T, name string) []byte {
 
 - [ ] **Step 6: Add both modules to `go.work` and build**
 
-Append to `go.work` `use (...)`: `./pkg/limits` and `./pkg/testsupport` (already
-listed in Task 3 Step 4 — verify they resolve now).
+Now that both `go.mod` files exist, widen the single-module `use` directive into
+a block:
+
+```go
+go 1.23
+
+use (
+	./gen/go
+	./pkg/limits
+	./pkg/testsupport
+)
+```
 
 Run: `go build ./... && go test ./...`
 Expected: exit 0, `pkg/limits` tests PASS.
@@ -915,13 +935,27 @@ func violations(pkg string, imports []string) []string {
 Run: `cd tools && go test ./checkboundaries/...`
 Expected: PASS, 5 subtests.
 
-- [ ] **Step 5: Run it against the real workspace**
+- [ ] **Step 5: Add `./tools` to `go.work`**
+
+The root `Makefile` runs `go run ./tools/checkboundaries`, which does not resolve
+unless the module is in the workspace:
+
+```go
+use (
+	./gen/go
+	./pkg/limits
+	./pkg/testsupport
+	./tools
+)
+```
+
+- [ ] **Step 6: Run it against the real workspace**
 
 Run: `go run ./tools/checkboundaries`
 Expected: `module boundaries OK` (no services exist yet — this proves the tool runs
 clean rather than proving anything about the code).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add tools go.work
@@ -971,9 +1005,17 @@ jobs:
 
       # An SDK deployed into third-party apps cannot be force-upgraded, so a
       # breaking envelope change is unfixable once shipped.
+      # Single quotes would pass the literal $(...) to buf. The tag and the
+      # no-tag fallback also need different buf revision syntax: `tag=` only
+      # accepts a real tag, so HEAD~1 must be given as `ref=`.
       - name: Breaking change check
-        run: buf breaking --against '.git#tag=$(git describe --tags --abbrev=0 2>/dev/null || echo HEAD~1)'
-        continue-on-error: false
+        run: |
+          tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -n "$tag" ]; then
+            buf breaking --against ".git#tag=$tag"
+          else
+            buf breaking --against '.git#ref=HEAD~1'
+          fi
 
       - name: Generated code is up to date
         run: make gen-check
@@ -1051,7 +1093,12 @@ make test              # go test ./...
 2. `clients/flutter_sdk` and `services/*` share exactly one thing: `gen/`.
 3. `pkg/*` may not import `services/*`.
 
-Enforced by `tools/checkboundaries` in CI, not by convention.
+Rules 1 and 3 are enforced by `tools/checkboundaries` in CI. **Rule 2 is not** —
+it spans the Go/Dart line, which the Go import graph cannot see. It holds
+structurally instead: the SDK is a separate pub package with no path dependency
+on any Go module, so `flutter pub get` has nothing to resolve against
+`services/*`. The `flutter-sdk` CI job building the package in isolation is what
+would fail if that ever changed.
 
 ### Why `gen/` is committed
 

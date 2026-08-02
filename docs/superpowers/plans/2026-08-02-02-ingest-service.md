@@ -41,6 +41,9 @@ Copied verbatim from the spec. Every task's requirements implicitly include this
 | `pkg/tenant/token.go` | JWT minting (exchange side) |
 | `pkg/tenant/verify.go` | JWT verification + JWKS cache (ingest side) |
 | `pkg/tenant/legacy.go` | Legacy `wk_live_` dual-accept, per-tenant cutoff flag |
+| `pkg/controlplane/migrate.go` | Postgres pool + forward-only migration runner |
+| `pkg/controlplane/store.go` | Tenant, install, quota, and legacy-key queries |
+| `pkg/controlplane/keys.go` | Signing-key source and JWKS publication |
 | `services/ingest/internal/validate/validate.go` | Per-event validation → `Reject` list |
 | `services/ingest/internal/enrich/skew.go` | Per-session clock offset + clamp |
 | `services/ingest/internal/enrich/enrich.go` | Envelope → storage row |
@@ -49,6 +52,8 @@ Copied verbatim from the spec. Every task's requirements implicitly include this
 | `services/ingest/internal/handler/token.go` | `POST /v1/auth/token` |
 | `services/ingest/internal/attest/attest.go` | App Attest / Play Integrity verification |
 | `services/ingest/cmd/main.go` | Wiring, config, listen |
+| `services/ingest/cmd/jwks.go` | `GET /.well-known/jwks.json` |
+| `deploy/ingest.Dockerfile` | Build image for the compose stack |
 
 ---
 
@@ -146,6 +151,34 @@ func TestReplacingMergeTreeCollapsesOnlyTrueDuplicates(t *testing.T) {
 	}
 	if n != 2 {
 		t.Errorf("row count after merge = %d, want 2 (one collapsed duplicate, two distinct events)", n)
+	}
+}
+
+// Each migration file must run exactly once, and be recorded as such. Without
+// the ledger this only works while every migration is coincidentally
+// idempotent.
+func TestMigrateAppliesEachFileOnce(t *testing.T) {
+	ctx := context.Background()
+	conn := startClickHouse(t)
+
+	for i := 0; i < 3; i++ {
+		if err := clickhouse.Migrate(ctx, conn, clickhouse.Migrations); err != nil {
+			t.Fatalf("migrate run %d: %v", i, err)
+		}
+	}
+
+	var n uint64
+	if err := conn.QueryRow(ctx,
+		`SELECT count() FROM (SELECT DISTINCT name FROM schema_migrations)`).Scan(&n); err != nil {
+		t.Fatalf("count migrations: %v", err)
+	}
+
+	var files uint64
+	if err := conn.QueryRow(ctx, `SELECT count() FROM schema_migrations`).Scan(&files); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if files != n {
+		t.Errorf("schema_migrations has %d rows for %d distinct migrations — a file ran twice", files, n)
 	}
 }
 
@@ -250,11 +283,38 @@ func mustSub(f embed.FS, dir string) fs.FS {
 	return sub
 }
 
-// Migrate applies every .sql file in dir in lexical order. Each file may hold
-// multiple statements separated by ";". Statements are idempotent by
-// convention (CREATE TABLE IF NOT EXISTS), so re-running is safe and there is
-// no version table to drift out of sync with reality.
+// schemaMigrationsDDL tracks which migration files have been applied.
+//
+// Relying on CREATE TABLE IF NOT EXISTS for idempotency only works while every
+// migration happens to be idempotent. The first ALTER, backfill, or data
+// migration breaks that silently — re-running it either errors or, worse,
+// applies twice. A ledger costs one small table and removes the whole class.
+const schemaMigrationsDDL = `
+CREATE TABLE IF NOT EXISTS schema_migrations
+(
+    name       String,
+    applied_at DateTime DEFAULT now()
+)
+ENGINE = MergeTree
+ORDER BY name`
+
+// Migrate applies each unapplied .sql file in dir, in lexical order, exactly
+// once. Each file may hold multiple statements separated by ";".
+//
+// A file is recorded only after all of its statements succeed, so a partially
+// applied file is retried on the next run rather than being skipped. That
+// makes each individual migration's own statements the thing that must be
+// safe to re-run — ClickHouse has no transactional DDL to lean on.
 func Migrate(ctx context.Context, conn driver.Conn, dir fs.FS) error {
+	if err := conn.Exec(ctx, schemaMigrationsDDL); err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	applied, err := appliedMigrations(ctx, conn)
+	if err != nil {
+		return err
+	}
+
 	entries, err := fs.ReadDir(dir, ".")
 	if err != nil {
 		return fmt.Errorf("read migrations: %w", err)
@@ -269,6 +329,10 @@ func Migrate(ctx context.Context, conn driver.Conn, dir fs.FS) error {
 	sort.Strings(names)
 
 	for _, name := range names {
+		if _, done := applied[name]; done {
+			continue
+		}
+
 		body, err := fs.ReadFile(dir, name)
 		if err != nil {
 			return fmt.Errorf("read %s: %w", name, err)
@@ -282,8 +346,31 @@ func Migrate(ctx context.Context, conn driver.Conn, dir fs.FS) error {
 				return fmt.Errorf("%s: %w", name, err)
 			}
 		}
+
+		if err := conn.Exec(ctx,
+			`INSERT INTO schema_migrations (name) VALUES (?)`, name); err != nil {
+			return fmt.Errorf("record %s: %w", name, err)
+		}
 	}
 	return nil
+}
+
+func appliedMigrations(ctx context.Context, conn driver.Conn) (map[string]struct{}, error) {
+	rows, err := conn.Query(ctx, `SELECT DISTINCT name FROM schema_migrations`)
+	if err != nil {
+		return nil, fmt.Errorf("read schema_migrations: %w", err)
+	}
+	defer rows.Close()
+
+	applied := map[string]struct{}{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan schema_migrations: %w", err)
+		}
+		applied[name] = struct{}{}
+	}
+	return applied, rows.Err()
 }
 ```
 
@@ -514,6 +601,10 @@ func Open(ctx context.Context, cfg Config) (driver.Conn, error) {
 		return nil, fmt.Errorf("open clickhouse: %w", err)
 	}
 	if err := conn.Ping(ctx); err != nil {
+		// ch.Open already handed back a live pool. Returning without closing it
+		// leaks connections on every failed start — which is exactly the path a
+		// crash-looping pod takes.
+		_ = conn.Close()
 		return nil, fmt.Errorf("ping clickhouse: %w", err)
 	}
 	return conn, nil
@@ -785,9 +876,18 @@ CREATE TABLE installs (
     platform       TEXT NOT NULL,
     trust_tier     SMALLINT NOT NULL,
     attest_subject TEXT,                -- derived from the attestation at tier 0
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (tenant_id, attest_subject)
+    device_key     TEXT,                -- tier 1 anchor; see deviceKey() in Task 10
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Two partial indexes, not one UNIQUE over nullable columns. Postgres treats
+-- NULLs as distinct, so UNIQUE (tenant_id, attest_subject) would happily admit
+-- unlimited unattested rows — letting a Tier 1 client mint a fresh install_id,
+-- and therefore a fresh rate-limit bucket, on every exchange.
+CREATE UNIQUE INDEX installs_attested
+    ON installs (tenant_id, attest_subject) WHERE attest_subject IS NOT NULL;
+CREATE UNIQUE INDEX installs_unattested
+    ON installs (tenant_id, device_key) WHERE attest_subject IS NULL;
 
 -- Per-session clock offset. Persisted so a retry gets the same ts as the
 -- original: recomputing per-request would move the row under the sort key and
@@ -1117,6 +1217,78 @@ func TestVerifyRejectsKeyNotMarkedForSigning(t *testing.T) {
 	}
 }
 
+// "Unspecified" must not be read as "signing".
+func TestVerifyRejectsKeyWithNoUse(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	js := newJWKS(t, "kid-1", pub, "", "OKP")
+	v := tenant.NewVerifier(js.URL, testIssuer, testAudience, js.Client())
+
+	if _, err := v.Verify(context.Background(), mint(t, priv, "kid-1", nil), time.Now()); !errors.Is(err, tenant.ErrUnknownKID) {
+		t.Errorf("err = %v, want ErrUnknownKID for a key with no use field", err)
+	}
+}
+
+// Containment is not enough: a token minted for several audiences, one of them
+// ours, was issued for somebody else's purpose.
+func TestVerifyRejectsExtraAudiences(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	js := newJWKS(t, "kid-1", pub, "sig", "OKP")
+	v := tenant.NewVerifier(js.URL, testIssuer, testAudience, js.Client())
+
+	tok := mint(t, priv, "kid-1", func(b *jwt.Builder) {
+		b.Audience([]string{testAudience, "https://other.example"})
+	})
+	if _, err := v.Verify(context.Background(), tok, time.Now()); !errors.Is(err, tenant.ErrBadAudience) {
+		t.Errorf("err = %v, want ErrBadAudience", err)
+	}
+}
+
+// A missing trust_tier must not silently become Tier 0, the privileged tier.
+func TestVerifyRejectsMissingOrInvalidTrustTier(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	js := newJWKS(t, "kid-1", pub, "sig", "OKP")
+	v := tenant.NewVerifier(js.URL, testIssuer, testAudience, js.Client())
+
+	cases := map[string]func(*jwt.Builder){
+		"missing":  func(b *jwt.Builder) { b.Claim("trust_tier", nil) },
+		"negative": func(b *jwt.Builder) { b.Claim("trust_tier", -1) },
+		"oversize": func(b *jwt.Builder) { b.Claim("trust_tier", 256) },
+		"unknown":  func(b *jwt.Builder) { b.Claim("trust_tier", 7) },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := v.Verify(context.Background(), mint(t, priv, "kid-1", mutate), time.Now()); err == nil {
+				t.Error("accepted a token with an invalid trust_tier")
+			}
+		})
+	}
+}
+
+// A JWKS outage may be ridden out briefly, never indefinitely.
+func TestVerifyFailsClosedOnceStaleGraceExpires(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	js := newJWKS(t, "kid-1", pub, "sig", "OKP")
+	v := tenant.NewVerifier(js.URL, testIssuer, testAudience, js.Client())
+
+	start := time.Now()
+	if _, err := v.Verify(context.Background(), mint(t, priv, "kid-1", nil), start); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	js.Close() // JWKS endpoint goes away
+
+	// Inside the grace window: still verifiable.
+	within := start.Add(11 * time.Minute)
+	if _, err := v.Verify(context.Background(), mint(t, priv, "kid-1", nil), within); err != nil {
+		t.Errorf("rejected inside the stale grace window: %v", err)
+	}
+
+	// Past it: fails closed rather than trusting a key set of unknown age.
+	beyond := start.Add(30 * time.Minute)
+	if _, err := v.Verify(context.Background(), mint(t, priv, "kid-1", nil), beyond); err == nil {
+		t.Error("accepted a token against an indefinitely stale JWKS")
+	}
+}
+
 // A forged kid must not be able to drive unbounded JWKS traffic. One refetch,
 // rate-limited, then the answer is cached-miss.
 func TestVerifyForgedKIDRefetchesAtMostOnce(t *testing.T) {
@@ -1192,6 +1364,12 @@ const jwksMinRefetch = 30 * time.Second
 // and new keys so in-flight tokens stay verifiable across a rotation.
 const jwksTTL = 10 * time.Minute
 
+// jwksStaleGrace is how far past the TTL a cached key set may still be used
+// when the JWKS endpoint is unreachable. Bounded on purpose: a brief outage
+// should not stop ingestion, but an indefinite one must not keep a retired key
+// verifiable forever. Past this, verification fails closed.
+const jwksStaleGrace = 5 * time.Minute
+
 type Verifier struct {
 	url      string
 	issuer   string
@@ -1253,8 +1431,11 @@ func (v *Verifier) Verify(ctx context.Context, bearer string, now time.Time) (Cl
 	if iss, ok := tok.Issuer(); !ok || iss != v.issuer {
 		return Claims{}, fmt.Errorf("%w: %q", ErrBadIssuer, iss)
 	}
+	// Exact match, not containment. A token carrying this audience alongside
+	// others was minted for a different purpose and happens to name us; the
+	// contract says aud matches the ingest audience exactly.
 	aud, _ := tok.Audience()
-	if !containsString(aud, v.audience) {
+	if len(aud) != 1 || aud[0] != v.audience {
 		return Claims{}, fmt.Errorf("%w: %v", ErrBadAudience, aud)
 	}
 	if exp, ok := tok.Expiration(); !ok || now.After(exp.Add(clockSkew)) {
@@ -1279,8 +1460,16 @@ func (v *Verifier) Verify(ctx context.Context, bearer string, now time.Time) (Cl
 	}
 	c.Scope = scope
 
+	// The claim is required and closed to the two defined tiers. Swallowing the
+	// error would make a missing claim mean Tier 0 — the *privileged* tier — and
+	// a bare uint8 conversion would wrap a negative or oversized value into it.
 	var tier int
-	_ = tok.Get("trust_tier", &tier)
+	if err := tok.Get("trust_tier", &tier); err != nil {
+		return Claims{}, fmt.Errorf("%w: missing trust_tier", ErrMalformed)
+	}
+	if tier != 0 && tier != 1 {
+		return Claims{}, fmt.Errorf("%w: trust_tier %d", ErrMalformed, tier)
+	}
 	c.TrustTier = uint8(tier)
 
 	return c, nil
@@ -1298,8 +1487,16 @@ func (v *Verifier) key(ctx context.Context, kid string, now time.Time) (jwk.Key,
 
 	stale := v.set == nil || now.Sub(v.fetchedAt) > jwksTTL
 	if stale {
-		if err := v.refetchLocked(ctx, now); err != nil && v.set == nil {
-			return nil, err
+		if err := v.refetchLocked(ctx, now); err != nil {
+			// Serving from a cached set after a failed refresh is deliberate —
+			// a JWKS blip must not take ingestion down — but it is bounded.
+			// Past the grace period the set is discarded: continuing to trust
+			// it indefinitely would keep a retired or compromised signing key
+			// valid for as long as the endpoint stays unreachable.
+			if v.set == nil || now.Sub(v.fetchedAt) > jwksTTL+jwksStaleGrace {
+				v.set = nil
+				return nil, fmt.Errorf("%w: JWKS unavailable and cache expired: %v", ErrUnknownKID, err)
+			}
 		}
 	}
 
@@ -1342,7 +1539,11 @@ func lookup(set jwk.Set, kid string) (jwk.Key, bool) {
 	if !ok {
 		return nil, false
 	}
-	if k.KeyUsage() != "" && k.KeyUsage() != "sig" {
+	// Explicitly marked for signing. An absent `use` is rejected too: the
+	// contract requires the key to be published for this purpose, and treating
+	// "unspecified" as "signing" is how an encryption key ends up verifying
+	// tokens.
+	if k.KeyUsage() != "sig" {
 		return nil, false
 	}
 	if k.KeyType().String() != "OKP" {
@@ -1364,20 +1565,12 @@ func hasScope(scope, want string) bool {
 	return false
 }
 
-func containsString(xs []string, want string) bool {
-	for _, x := range xs {
-		if x == want {
-			return true
-		}
-	}
-	return false
-}
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd pkg/tenant && go test ./... -v`
-Expected: PASS, 10 tests.
+Expected: PASS, 14 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -2051,7 +2244,7 @@ git commit -m "feat(ingest): build storage rows from verified claims, never the 
 **Interfaces:**
 - Consumes: `tenant.Claims`.
 - Produces:
-  - `type Limits struct { DailyEvents int64; RPS int }`
+  - `type Limits struct { DailyEvents int64; RPS int; LegacyRPS int }`
   - `type Checker struct{ ... }`
   - `func NewChecker(rdb *redis.Client) *Checker`
   - `func (c *Checker) Allow(ctx context.Context, cl tenant.Claims, lim Limits, n int, now time.Time) (Decision, error)`
@@ -2142,7 +2335,50 @@ func TestRateLimitWindowRollsOver(t *testing.T) {
 		t.Errorf("next second denied, want allowed")
 	}
 }
+
+// Check-and-consume must be one atomic operation. With separate increment,
+// compare, and rollback steps, a denied request's DECRBY can land after another
+// pod's increment and quietly refund budget that was legitimately spent.
+func TestConcurrentAllowNeverOverspendsOrUndercounts(t *testing.T) {
+	ctx := context.Background()
+	rdb := startRedis(t)
+	c := quota.NewChecker(rdb)
+	cl := tenant.Claims{TenantID: "t1", InstallID: "i-1"}
+	lim := quota.Limits{DailyEvents: 50, RPS: 1_000_000}
+	now := time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC)
+
+	const workers = 40
+	var granted atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d, err := c.Allow(ctx, cl, lim, 2, now)
+			if err == nil && d.Allowed {
+				granted.Add(2)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := granted.Load(); got != 50 {
+		t.Errorf("granted %d events against a budget of 50", got)
+	}
+
+	// And the stored counter must agree with what was granted — a blind
+	// rollback racing another increment shows up here as a refund.
+	stored, err := rdb.Get(ctx, "q:{t1}:2026-08-02").Int64()
+	if err != nil {
+		t.Fatalf("read counter: %v", err)
+	}
+	if stored != granted.Load() {
+		t.Errorf("counter = %d but %d granted — rollback raced an increment", stored, granted.Load())
+	}
+}
 ```
+
+Add `"sync"` and `"sync/atomic"` to the test imports.
 
 Add a `startRedis` helper in `quota_testmain_test.go` mirroring the ClickHouse
 helper from Task 1, using
@@ -2186,6 +2422,11 @@ import (
 type Limits struct {
 	DailyEvents int64
 	RPS         int
+
+	// LegacyRPS applies to pre-token wk_live_ credentials during the cutover.
+	// Deliberately below the tier-1 rate: deprecation pressure the SDK already
+	// absorbs, because it backs off on 429.
+	LegacyRPS int
 }
 
 type Decision struct {
@@ -2202,59 +2443,68 @@ func NewChecker(rdb *redis.Client) *Checker {
 	return &Checker{rdb: rdb}
 }
 
+// allowScript is a single atomic check-and-consume across both counters.
+//
+// The obvious implementation — increment, compare, DECRBY on denial — is
+// wrong under concurrency: a denied request's rollback can land after another
+// pod's increment, refunding budget that was legitimately spent. Nothing is
+// consumed here unless the whole batch is admitted, so there is no rollback to
+// race in the first place.
+//
+// Both keys use the same {tenant} hash tag, so they land on one slot and the
+// script stays valid under Redis Cluster.
+var allowScript = redis.NewScript(`
+local rate_key   = KEYS[1]
+local day_key    = KEYS[2]
+local n          = tonumber(ARGV[1])
+local rps        = tonumber(ARGV[2])
+local daily      = tonumber(ARGV[3])
+local rate_ttl   = tonumber(ARGV[4])
+local day_ttl    = tonumber(ARGV[5])
+
+local rate = tonumber(redis.call('GET', rate_key) or '0')
+if rps > 0 and rate + n > rps then
+  return {0, 'rate_limit'}
+end
+
+local day = tonumber(redis.call('GET', day_key) or '0')
+if daily > 0 and day + n > daily then
+  return {0, 'daily_quota'}
+end
+
+redis.call('INCRBY', rate_key, n)
+redis.call('EXPIRE', rate_key, rate_ttl)
+redis.call('INCRBY', day_key, n)
+redis.call('EXPIRE', day_key, day_ttl)
+return {1, ''}
+`)
+
 // Allow accounts n events and reports whether the batch may proceed.
 //
-// Both counters are incremented before the verdict, then rolled back on denial,
-// so two concurrent pods cannot both squeeze past the last unit of budget. The
-// rollback is best-effort: over-counting a denied batch costs the tenant
-// nothing real, whereas under-counting lets the limit be exceeded.
+// Consumption is all-or-nothing: a denied batch consumes no budget at all.
 func (c *Checker) Allow(ctx context.Context, cl tenant.Claims, lim Limits, n int, now time.Time) (Decision, error) {
 	rateKey := fmt.Sprintf("rl:{%s}:%s:%d", cl.TenantID, cl.InstallID, now.Unix())
 	dayKey := fmt.Sprintf("q:{%s}:%s", cl.TenantID, now.UTC().Format("2006-01-02"))
 
-	rate, err := c.incr(ctx, rateKey, int64(n), 2*time.Second)
+	res, err := allowScript.Run(ctx, c.rdb,
+		[]string{rateKey, dayKey},
+		n, lim.RPS, lim.DailyEvents, 2, int((48 * time.Hour).Seconds()),
+	).Slice()
 	if err != nil {
-		return Decision{}, err
-	}
-	if lim.RPS > 0 && rate > int64(lim.RPS) {
-		c.rollback(ctx, rateKey, int64(n))
-		return Decision{
-			Allowed:    false,
-			RetryAfter: time.Second,
-			Reason:     "rate_limit",
-		}, nil
+		return Decision{}, fmt.Errorf("quota check: %w", err)
 	}
 
-	day, err := c.incr(ctx, dayKey, int64(n), 48*time.Hour)
-	if err != nil {
-		return Decision{}, err
-	}
-	if lim.DailyEvents > 0 && day > lim.DailyEvents {
-		c.rollback(ctx, dayKey, int64(n))
-		c.rollback(ctx, rateKey, int64(n))
-		return Decision{
-			Allowed:    false,
-			RetryAfter: untilNextUTCDay(now),
-			Reason:     "daily_quota",
-		}, nil
+	allowed, _ := res[0].(int64)
+	reason, _ := res[1].(string)
+	if allowed == 1 {
+		return Decision{Allowed: true}, nil
 	}
 
-	return Decision{Allowed: true}, nil
-}
-
-func (c *Checker) incr(ctx context.Context, key string, by int64, ttl time.Duration) (int64, error) {
-	pipe := c.rdb.TxPipeline()
-	incr := pipe.IncrBy(ctx, key, by)
-	pipe.Expire(ctx, key, ttl)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return 0, fmt.Errorf("quota incr %s: %w", key, err)
+	retryAfter := time.Second
+	if reason == "daily_quota" {
+		retryAfter = untilNextUTCDay(now)
 	}
-	return incr.Val(), nil
-}
-
-func (c *Checker) rollback(ctx context.Context, key string, by int64) {
-	// Best effort. A failed rollback over-counts, which is the safe direction.
-	_ = c.rdb.DecrBy(ctx, key, by).Err()
+	return Decision{Allowed: false, RetryAfter: retryAfter, Reason: reason}, nil
 }
 
 // untilNextUTCDay is the honest Retry-After for an exhausted daily budget:
@@ -2267,8 +2517,9 @@ func untilNextUTCDay(now time.Time) time.Duration {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cd services/ingest && go test ./internal/quota/... -v`
-Expected: PASS, 3 tests.
+Run: `cd services/ingest && go test ./internal/quota/... -race -v`
+Expected: PASS, 4 tests. `-race` is not optional here — the concurrency test is
+the only thing standing between this and a silently refunding quota.
 
 - [ ] **Step 5: Commit**
 
@@ -2281,6 +2532,11 @@ git commit -m "feat(ingest): redis quota and install-keyed rate limiting"
 
 ### Task 9: The batch handler
 
+> **Do Task 11 first.** The handler authenticates via
+> `tenant.VerifyOrLegacy`, which Task 11 adds. Task 11 has no dependency on this
+> task, so run it out of order rather than wiring `Verify` here and rewriting it
+> later.
+
 **Files:**
 - Create: `services/ingest/internal/handler/batch.go`
 - Test: `services/ingest/internal/handler/batch_test.go`
@@ -2288,7 +2544,7 @@ git commit -m "feat(ingest): redis quota and install-keyed rate limiting"
 **Interfaces:**
 - Consumes: `tenant.Verifier`, `validate.Event`, `enrich.Row`, `enrich.OffsetStore`, `quota.Checker`, `clickhouse.InsertEvents`, `limits.*`.
 - Produces:
-  - `type Deps struct { Verifier *tenant.Verifier; Offsets enrich.OffsetStore; Quota *quota.Checker; LimitsFor func(ctx context.Context, tenantID string, tier uint8) (quota.Limits, error); Insert func(ctx context.Context, rows []clickhouse.Row) error; Now func() time.Time }`
+  - `type Deps struct { Verifier *tenant.Verifier; Legacy tenant.LegacyResolver; Offsets enrich.OffsetStore; Quota *quota.Checker; LimitsFor func(ctx context.Context, tenantID string, tier uint8) (quota.Limits, error); Insert func(ctx context.Context, rows []clickhouse.Row) error; Now func() time.Time; OnLegacyUse func(tenantID, sdkVersion string) }`
   - `func NewBatch(d Deps) http.Handler`
 
 - [ ] **Step 1: Write the failing test**
@@ -2421,30 +2677,130 @@ func TestInsertFailureReturns503AndAcceptsNothing(t *testing.T) {
 	}
 }
 
-// A tenant_id in the body must be ignored, never preferred over the claim.
-func TestBodyTenantIDIsIgnored(t *testing.T) {
+// A tenant_id in the body is rejected as an unknown field, never quietly
+// dropped and never preferred over the claim. Silently accepting it would let a
+// client believe it had set something it had not.
+func TestBodyTenantIDIsRejected(t *testing.T) {
 	h, sink := newTestHandler(t) // claims tenant is "t1"
 	body := []byte(`{"sentAt":"1754092800000","events":[{"eventId":"0191f4a2-1c3d-7000-8000-000000000001","name":"n","deviceId":"d1","tsClient":"1754092800000","tenantId":"attacker-tenant"}]}`)
 
 	rec := post(t, h, body, false)
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for an unknown body field", rec.Code)
+	}
+	if len(sink.rows) != 0 {
+		t.Errorf("stored %d rows for a rejected batch, want 0", len(sink.rows))
+	}
+}
+
+// An oversized *uncompressed* body must be a 413 like every other
+// too-large batch. MaxBytesReader surfaces its own error type, which is easy to
+// let fall through to the generic 400 — and a 400 tells the client to drop the
+// batch instead of halving it.
+func TestOversizedUncompressedBodyReturns413(t *testing.T) {
+	h, _ := newTestHandler(t)
+
+	// One event with a huge string property, sent without gzip.
+	big := strings.Repeat("x", limits.MaxBatchBytes+1024)
+	body := []byte(`{"sentAt":"1754092800000","events":[{"eventId":"0191f4a2-1c3d-7000-8000-000000000001","name":"n","deviceId":"d1","tsClient":"1754092800000","props":{"blob":{"stringValue":"` + big + `"}}}]}`)
+
+	rec := post(t, h, body, false)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", rec.Code)
+	}
+}
+
+// Every event carries its own session. One offset applied across the batch
+// gives events from a second device or session the wrong corrected timestamp.
+func TestOffsetIsResolvedPerSessionNotPerBatch(t *testing.T) {
+	h, sink := newTestHandler(t)
+
+	body := batchJSON(t, []map[string]any{
+		{"eventId": "0191f4a2-1c3d-7000-8000-000000000001", "name": "n", "deviceId": "d1", "sessionId": "s1", "tsClient": "1754092800000"},
+		{"eventId": "0191f4a2-1c3d-7000-8000-000000000002", "name": "n", "deviceId": "d2", "sessionId": "s2", "tsClient": "1754092800000"},
+	})
+
+	if rec := post(t, h, body, false); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if len(sink.rows) != 1 {
-		t.Fatalf("rows = %d, want 1", len(sink.rows))
+	if len(sink.offsetKeys) != 2 {
+		t.Errorf("resolved %d session offsets, want one per distinct (device, session): %v",
+			len(sink.offsetKeys), sink.offsetKeys)
 	}
-	if sink.rows[0].TenantID != "t1" {
-		t.Errorf("stored tenant_id = %q, want t1 from the verified claim", sink.rows[0].TenantID)
+}
+
+// An offset the store cannot resolve must not be silently replaced with zero:
+// a replay would then land at a different ts, move under the sort key, and stop
+// deduplicating. Fail the batch instead — the client still holds the events.
+func TestOffsetStoreFailureReturns503(t *testing.T) {
+	h := newTestHandlerFailingOffsets(t)
+	rec := post(t, h, batchJSON(t, []map[string]any{
+		{"eventId": "0191f4a2-1c3d-7000-8000-000000000001", "name": "n", "deviceId": "d1", "sessionId": "s1", "tsClient": "1754092800000"},
+	}), false)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rec.Code)
+	}
+}
+
+// Legacy write keys must reach the legacy path, not JWT parsing.
+func TestLegacyWriteKeyIsAccepted(t *testing.T) {
+	h, sink := newTestHandlerWithLegacy(t, tenant.ModeDualAccept)
+
+	rec := postWithAuth(t, h, batchJSON(t, []map[string]any{
+		{"eventId": "0191f4a2-1c3d-7000-8000-000000000001", "name": "n", "deviceId": "d1", "tsClient": "1754092800000"},
+	}), "Bearer wk_live_abc123")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body)
+	}
+	if len(sink.rows) != 1 || sink.rows[0].TrustTier != 1 {
+		t.Errorf("legacy row = %+v, want one row at tier 1", sink.rows)
+	}
+}
+
+func TestLegacyWriteKeyRejectedAtCutoff(t *testing.T) {
+	h, _ := newTestHandlerWithLegacy(t, tenant.ModeCutoff)
+
+	rec := postWithAuth(t, h, batchJSON(t, nil), "Bearer wk_live_abc123")
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 after cutoff", rec.Code)
 	}
 }
 ```
 
-Write the fixtures (`newTestHandler`, `newTestHandlerWithQuota`,
-`newTestHandlerFailingInsert`, `batchJSON`, `post`, `decode`, `pad`) in
-`handler_fixtures_test.go`. They wire a `Deps` with an in-memory offset store, a
-`quota.Checker` backed by a `miniredis`-style test double or a real container, a
-capturing insert function (`sink.rows`), and a `tenant.Verifier` primed against a
-local JWKS `httptest` server minting `tenant_id=t1`.
+Write the fixtures in `handler_fixtures_test.go`: `newTestHandler`,
+`newTestHandlerWithQuota`, `newTestHandlerFailingInsert`,
+`newTestHandlerFailingOffsets`, `newTestHandlerWithLegacy`, `batchJSON`, `post`,
+`postWithAuth`, `decode`, `pad`.
+
+They wire a `Deps` with an in-memory offset store, a `quota.Checker` backed by a
+real Redis container, a capturing insert function, and a `tenant.Verifier`
+primed against a local JWKS `httptest` server minting `tenant_id=t1`.
+
+The `sink` records both what was inserted and which session keys were resolved,
+so the per-session offset test can assert on the second:
+
+```go
+type sink struct {
+	rows       []clickhouse.Row
+	offsetKeys []enrich.SessionKey
+}
+
+// recordingOffsets wraps a real store and notes every key it was asked for.
+type recordingOffsets struct {
+	inner enrich.OffsetStore
+	sink  *sink
+}
+
+func (r *recordingOffsets) GetOrSet(ctx context.Context, k enrich.SessionKey, candidate int64) (int64, error) {
+	r.sink.offsetKeys = append(r.sink.offsetKeys, k)
+	return r.inner.GetOrSet(ctx, k, candidate)
+}
+```
+
+`newTestHandlerWithLegacy(t, mode)` supplies a `Legacy` resolver returning
+`("t1", mode, nil)` for any `wk_live_` key.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -2483,12 +2839,22 @@ import (
 )
 
 type Deps struct {
-	Verifier  *tenant.Verifier
+	Verifier *tenant.Verifier
+
+	// Legacy resolves pre-token wk_live_ write keys during the cutover. Without
+	// it every legacy credential goes to JWT parsing and fails, so the staged
+	// deprecation never actually runs.
+	Legacy tenant.LegacyResolver
+
 	Offsets   enrich.OffsetStore
 	Quota     *quota.Checker
 	LimitsFor func(ctx context.Context, tenantID string, tier uint8) (quota.Limits, error)
 	Insert    func(ctx context.Context, rows []clickhouse.Row) error
 	Now       func() time.Time
+
+	// OnLegacyUse counts legacy credential usage per tenant and SDK version.
+	// That count is what tells you when a cutoff is safe.
+	OnLegacyUse func(tenantID, sdkVersion string)
 }
 
 func NewBatch(d Deps) http.Handler {
@@ -2498,11 +2864,13 @@ func NewBatch(d Deps) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedAt := d.Now()
 
-		claims, err := d.Verifier.Verify(r.Context(), r.Header.Get("Authorization"), receivedAt)
+		claims, isLegacy, err := d.Verifier.VerifyOrLegacy(
+			r.Context(), r.Header.Get("Authorization"), receivedAt, d.Legacy)
 		if err != nil {
 			// 401 tells the client to re-exchange for a fresh token and retry
 			// once. Any other code here would make an expired token look like
-			// a permanent failure and stop the device syncing.
+			// a permanent failure and stop the device syncing. A cutoff legacy
+			// key lands here too, which is the intended end state.
 			httpError(w, http.StatusUnauthorized, "invalid token")
 			return
 		}
@@ -2518,11 +2886,15 @@ func NewBatch(d Deps) http.Handler {
 		}
 
 		var req trackingv1.BatchRequest
-		// DiscardUnknown: a newer SDK sending a field this server does not know
-		// must not fail the batch. Notably this is also what makes a stray
-		// tenant_id in the body a no-op rather than an error — it is discarded,
-		// never read.
-		if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &req); err != nil {
+		// Strict decoding. DiscardUnknown would accept a body `tenantId` and
+		// answer 200, telling the client it had set something it had not — and
+		// the contract says a tenant field in the body is rejected as unknown.
+		//
+		// The cost is that a newer SDK sending a field this build does not know
+		// gets a 400. That is survivable precisely because the envelope is
+		// governed by `buf breaking` in CI: new fields ship to servers before
+		// they ship to clients, never the other way round.
+		if err := protojson.Unmarshal(body, &req); err != nil {
 			httpError(w, http.StatusBadRequest, "malformed batch envelope")
 			return
 		}
@@ -2531,10 +2903,23 @@ func NewBatch(d Deps) http.Handler {
 			return
 		}
 
+		if isLegacy && d.OnLegacyUse != nil {
+			var sdkVersion string
+			if len(req.Events) > 0 {
+				sdkVersion = req.Events[0].GetContext().GetSdkVersion()
+			}
+			d.OnLegacyUse(claims.TenantID, sdkVersion)
+		}
+
 		lim, err := d.LimitsFor(r.Context(), claims.TenantID, claims.TrustTier)
 		if err != nil {
 			httpError(w, http.StatusServiceUnavailable, "limits unavailable")
 			return
+		}
+		if isLegacy {
+			// Below tier 1, deliberately. Deprecation pressure that the SDK
+			// already knows how to absorb, since it backs off on 429.
+			lim.RPS = lim.LegacyRPS
 		}
 
 		dec, err := d.Quota.Allow(r.Context(), claims, lim, len(req.Events), receivedAt)
@@ -2552,13 +2937,36 @@ func NewBatch(d Deps) http.Handler {
 		rows := make([]clickhouse.Row, 0, len(req.Events))
 		accepted := make([]string, 0, len(req.Events))
 
-		offset := d.sessionOffset(r.Context(), claims, req, receivedAt)
+		// Offsets are memoised per (device, session) within the batch, so a
+		// 500-event batch from one session is still one store round-trip.
+		offsets := map[enrich.SessionKey]int64{}
 
 		for _, e := range req.Events {
 			if rej := validate.Event(e); rej != nil {
 				resp.Rejected = append(resp.Rejected, rej)
 				continue
 			}
+
+			key := enrich.SessionKey{
+				TenantID:  claims.TenantID,
+				DeviceID:  e.GetDeviceId(),
+				SessionID: e.GetSessionId(),
+			}
+			offset, ok := offsets[key]
+			if !ok {
+				offset, err = d.Offsets.GetOrSet(
+					r.Context(), key, enrich.CandidateOffset(req.GetSentAt(), receivedAt))
+				if err != nil {
+					// Falling back to a zero offset would give this delivery a
+					// different ts than its replay — moving the row under the
+					// sort key so ReplacingMergeTree never collapses the pair.
+					// A 503 keeps the events on the client instead.
+					httpError(w, http.StatusServiceUnavailable, "offset store unavailable")
+					return
+				}
+				offsets[key] = offset
+			}
+
 			row, _ := enrich.Row(e, claims, offset, receivedAt)
 			rows = append(rows, row)
 			accepted = append(accepted, e.GetEventId())
@@ -2585,29 +2993,6 @@ func NewBatch(d Deps) http.Handler {
 	})
 }
 
-// sessionOffset resolves the clock offset once per batch. Every event in a
-// batch shares a device and session in practice; if a batch spans sessions the
-// first event's session wins, which is acceptable because the offset is a
-// device-clock property, not a session property.
-func (d Deps) sessionOffset(ctx context.Context, c tenant.Claims, req trackingv1.BatchRequest, receivedAt time.Time) int64 {
-	if len(req.Events) == 0 {
-		return 0
-	}
-	first := req.Events[0]
-	key := enrich.SessionKey{
-		TenantID:  c.TenantID,
-		DeviceID:  first.GetDeviceId(),
-		SessionID: first.GetSessionId(),
-	}
-	offset, err := d.Offsets.GetOrSet(ctx, key, enrich.CandidateOffset(req.GetSentAt(), receivedAt))
-	if err != nil {
-		// A store failure must not drop the batch. Zero offset means the raw
-		// device clock is used, which the clamp still bounds.
-		return 0
-	}
-	return offset
-}
-
 var errTooLarge = errors.New("body too large")
 
 // readBody decompresses and enforces the decompressed size cap. The cap is on
@@ -2616,16 +3001,26 @@ func readBody(r *http.Request) ([]byte, error) {
 	var src io.Reader = http.MaxBytesReader(nil, r.Body, limits.MaxBatchBytes)
 
 	if r.Header.Get("Content-Encoding") == "gzip" {
-		zr, err := gzip.NewReader(r.Body)
+		zr, err := gzip.NewReader(src)
 		if err != nil {
 			return nil, err
 		}
 		defer zr.Close()
+		// +1 so an exactly-at-limit body is distinguishable from an over-limit
+		// one after the read.
 		src = io.LimitReader(zr, limits.MaxBatchBytes+1)
 	}
 
 	b, err := io.ReadAll(src)
 	if err != nil {
+		// MaxBytesReader reports its own error type rather than returning a
+		// short read. Left unmapped it falls through to the generic 400, which
+		// tells the client to *drop* the batch instead of halving it — turning
+		// a recoverable oversize into silent data loss.
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return nil, errTooLarge
+		}
 		return nil, err
 	}
 	if len(b) > limits.MaxBatchBytes {
@@ -2644,7 +3039,7 @@ func httpError(w http.ResponseWriter, code int, msg string) {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd services/ingest && go test ./internal/handler/... -v`
-Expected: PASS, 8 tests.
+Expected: PASS, 14 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -2665,8 +3060,9 @@ git commit -m "feat(ingest): partial-success batch handler with the full status 
 **Interfaces:**
 - Consumes: `tenant.Minter`, `trackingv1.TokenRequest/TokenResponse`.
 - Produces:
-  - `type Attestor interface { Verify(ctx context.Context, platform, blob string) (subject string, ok bool) }`
-  - `type NoopAttestor struct{}` — always Tier 1, for local dev
+  - `type Attestor interface { Verify(ctx context.Context, platform, blob, challenge string) (subject string, ok bool) }`
+  - `type Noop struct{}` — always Tier 1, for local dev
+  - `type ChallengeStore interface { Issue(ctx context.Context, clientID, platform string) (string, error); Consume(ctx context.Context, clientID, platform, challenge string) bool }`
   - `type TokenDeps struct { Minter *tenant.Minter; Attestor Attestor; ResolveTenant func(ctx, clientID string) (string, error); IssueInstall func(ctx context.Context, tenantID, platform, subject string, tier uint8) (string, error); Now func() time.Time }`
   - `func NewToken(d TokenDeps) http.Handler`
 
@@ -2687,7 +3083,7 @@ import (
 // Attestation failure must not block. Rooted, custom-ROM, and de-Googled
 // devices fail legitimately; simulators fail; Play Integrity is quota-limited.
 func TestAttestationFailureYieldsTier1NotRejection(t *testing.T) {
-	h := newTokenHandler(t, failingAttestor{})
+	h, _ := newTokenHandler(t, failingAttestor{})
 
 	rec := postJSON(t, h, "/v1/auth/token", `{"clientId":"pk_live_abc","platform":"android","attestation":"garbage"}`)
 	if rec.Code != http.StatusOK {
@@ -2705,9 +3101,11 @@ func TestAttestationFailureYieldsTier1NotRejection(t *testing.T) {
 }
 
 func TestSuccessfulAttestationYieldsTier0(t *testing.T) {
-	h := newTokenHandler(t, passingAttestor{subject: "attest-subject-1"})
+	h, challenges := newTokenHandler(t, passingAttestor{subject: "attest-subject-1"})
 
-	rec := postJSON(t, h, "/v1/auth/token", `{"clientId":"pk_live_abc","platform":"ios","attestation":"valid"}`)
+	nonce := issueChallenge(t, challenges, "pk_live_abc", "ios")
+	rec := postJSON(t, h, "/v1/auth/token",
+		`{"clientId":"pk_live_abc","platform":"ios","attestation":"valid","challenge":"`+nonce+`"}`)
 	var resp trackingv1.TokenResponse
 	decode(t, rec.Body.Bytes(), &resp)
 
@@ -2720,35 +3118,81 @@ func TestSuccessfulAttestationYieldsTier0(t *testing.T) {
 }
 
 func TestUnknownClientIDReturns401(t *testing.T) {
-	h := newTokenHandler(t, passingAttestor{})
+	h, _ := newTokenHandler(t, passingAttestor{})
 	rec := postJSON(t, h, "/v1/auth/token", `{"clientId":"pk_live_unknown","platform":"ios"}`)
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", rec.Code)
 	}
 }
 
+// One captured attestation must not mint Tier 0 tokens forever. The nonce is
+// single-use; a replay degrades to Tier 1 rather than being rejected outright,
+// because attestation assigns a tier and never blocks.
+func TestReplayedAttestationDegradesToTier1(t *testing.T) {
+	h, challenges := newTokenHandler(t, passingAttestor{subject: "attest-subject-1"})
+
+	nonce := issueChallenge(t, challenges, "pk_live_abc", "ios")
+	body := `{"clientId":"pk_live_abc","platform":"ios","attestation":"valid","challenge":"` + nonce + `"}`
+
+	var first trackingv1.TokenResponse
+	decode(t, postJSON(t, h, "/v1/auth/token", body).Body.Bytes(), &first)
+	if first.TrustTier != 0 {
+		t.Fatalf("first exchange trust_tier = %d, want 0", first.TrustTier)
+	}
+
+	var replay trackingv1.TokenResponse
+	rec := postJSON(t, h, "/v1/auth/token", body)
+	decode(t, rec.Body.Bytes(), &replay)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 — a replay is not an error", rec.Code)
+	}
+	if replay.TrustTier != 1 {
+		t.Errorf("replay trust_tier = %d, want 1", replay.TrustTier)
+	}
+}
+
+// A Tier 1 client must keep one install bucket across exchanges. A fresh
+// install_id each time would reset its own rate limit at will.
+func TestRepeatedTier1ExchangesReuseTheInstallBucket(t *testing.T) {
+	h, _ := newTokenHandler(t, failingAttestor{})
+	body := `{"clientId":"pk_live_abc","platform":"android","deviceHint":"stable-device-1"}`
+
+	var seen []string
+	for i := 0; i < 3; i++ {
+		var resp trackingv1.TokenResponse
+		decode(t, postJSON(t, h, "/v1/auth/token", body).Body.Bytes(), &resp)
+		seen = append(seen, installIDFromToken(t, resp.AccessToken))
+	}
+
+	if seen[0] != seen[1] || seen[1] != seen[2] {
+		t.Errorf("install_id changed across exchanges: %v — the rate-limit bucket resets", seen)
+	}
+}
+
 // A client must never be able to choose its own install_id: it is the primary
 // rate-limit bucket, so choosing it means resetting the limit at will.
 func TestClientSuppliedInstallIDIsIgnored(t *testing.T) {
-	h := newTokenHandler(t, passingAttestor{subject: "s1"})
+	h, challenges := newTokenHandler(t, passingAttestor{subject: "s1"})
+
+	nonce := issueChallenge(t, challenges, "pk_live_abc", "ios")
 	rec := postJSON(t, h, "/v1/auth/token",
-		`{"clientId":"pk_live_abc","platform":"ios","attestation":"valid","installId":"i-chosen-by-attacker"}`)
+		`{"clientId":"pk_live_abc","platform":"ios","attestation":"valid","challenge":"`+nonce+
+			`","installId":"i-chosen-by-attacker"}`)
 
-	var resp trackingv1.TokenResponse
-	decode(t, rec.Body.Bytes(), &resp)
-
-	installID := installIDFromToken(t, resp.AccessToken)
-	if installID == "i-chosen-by-attacker" {
-		t.Error("install_id was taken from the request body")
-	}
-	if installID == "" {
-		t.Error("no install_id issued")
+	// Strict decoding rejects the unknown installId outright — which is the
+	// strongest form of "never client-supplied" available.
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for an unknown installId field", rec.Code)
 	}
 }
 ```
 
-Fixtures: `newTokenHandler`, `failingAttestor`, `passingAttestor`, `postJSON`,
-`installIDFromToken` (parses the JWT without verifying and reads the claim).
+Fixtures: `newTokenHandler` (returns the handler and its
+`attest.ChallengeStore`), `failingAttestor`, `passingAttestor`, `postJSON`,
+`issueChallenge`, `installIDFromToken` (parses the JWT without verifying and
+reads the claim). The attestor doubles take the four-argument
+`Verify(ctx, platform, blob, challenge)` signature.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -2766,14 +3210,27 @@ Expected: FAIL — `undefined: handler.NewToken`.
 // Attestation is a per-app-start cost, not a per-batch cost.
 package attest
 
-import "context"
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
 
 // Attestor verifies a platform attestation blob and returns a stable subject
 // identifying the app install, plus whether verification succeeded.
 //
 // A false result is not an error condition — it assigns Tier 1.
+//
+// challenge is the server-issued nonce the client embedded in the attestation.
+// Both App Attest and Play Integrity bind a caller-supplied nonce into the
+// signed payload; verifying it is what stops one captured attestation from
+// being replayed for Tier 0 tokens indefinitely.
 type Attestor interface {
-	Verify(ctx context.Context, platform, blob string) (subject string, ok bool)
+	Verify(ctx context.Context, platform, blob, challenge string) (subject string, ok bool)
 }
 
 // Noop always reports failure, so every install lands at Tier 1. This is the
@@ -2781,8 +3238,62 @@ type Attestor interface {
 // design already treats attestation-unavailable as a tier, not a rejection.
 type Noop struct{}
 
-func (Noop) Verify(context.Context, string, string) (string, bool) { return "", false }
+func (Noop) Verify(context.Context, string, string, string) (string, bool) {
+	return "", false
+}
+
+// ChallengeStore issues and consumes one-time attestation nonces.
+type ChallengeStore interface {
+	Issue(ctx context.Context, clientID, platform string) (string, error)
+	Consume(ctx context.Context, clientID, platform, challenge string) bool
+}
+
+// RedisChallenges is the production ChallengeStore.
+//
+// The nonce is bound to the client ID and platform that requested it, and
+// consumed atomically via GETDEL so two concurrent exchanges cannot both spend
+// the same one.
+type RedisChallenges struct {
+	RDB *redis.Client
+	TTL time.Duration // 5 minutes is ample for an app-start round trip
+}
+
+func (c RedisChallenges) Issue(ctx context.Context, clientID, platform string) (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("challenge entropy: %w", err)
+	}
+	nonce := base64.RawURLEncoding.EncodeToString(raw)
+
+	if err := c.RDB.Set(ctx, c.key(clientID, platform, nonce), 1, c.TTL).Err(); err != nil {
+		return "", fmt.Errorf("store challenge: %w", err)
+	}
+	return nonce, nil
+}
+
+func (c RedisChallenges) Consume(ctx context.Context, clientID, platform, challenge string) bool {
+	if challenge == "" {
+		return false
+	}
+	// GETDEL: present-and-removed in one round trip. A second attempt with the
+	// same nonce finds nothing.
+	return c.RDB.GetDel(ctx, c.key(clientID, platform, challenge)).Err() == nil
+}
+
+func (c RedisChallenges) key(clientID, platform, nonce string) string {
+	return fmt.Sprintf("att:{%s}:%s:%s", clientID, platform, nonce)
+}
 ```
+
+The exchange therefore becomes two calls: `POST /v1/auth/challenge` returns a
+nonce, and `POST /v1/auth/token` carries it alongside the attestation. Add
+`challenge` to `TokenRequest` in `proto/tracking/v1/ingest.proto` (field 4) and
+regenerate.
+
+**A missing or already-spent challenge does not reject the exchange — it caps
+the result at Tier 1.** That keeps the design's central rule intact: attestation
+never blocks, it only assigns a tier. Replay buys the attacker nothing beyond
+what an unattested client already gets.
 
 Real App Attest / Play Integrity verification is a separate integration and is
 intentionally out of scope for this plan: `Noop` and the tier-1 path are fully
@@ -2809,17 +3320,18 @@ import (
 )
 
 type TokenDeps struct {
-	Minter   *tenant.Minter
-	Attestor attest.Attestor
+	Minter     *tenant.Minter
+	Attestor   attest.Attestor
+	Challenges attest.ChallengeStore
 
 	// ResolveTenant maps a public client ID to a tenant. Returns an error for
 	// unknown or revoked IDs.
 	ResolveTenant func(ctx context.Context, clientID string) (string, error)
 
-	// IssueInstall returns the server-side install identity. At Tier 0 it is
-	// derived from the attestation subject and is stable across app restarts;
-	// at Tier 1 it is minted and persisted server-side.
-	IssueInstall func(ctx context.Context, tenantID, platform, subject string, tier uint8) (string, error)
+	// IssueInstall returns the server-side install identity, stable across app
+	// restarts at both tiers. At Tier 0 it keys off the attestation subject; at
+	// Tier 1 it keys off deviceKey (below).
+	IssueInstall func(ctx context.Context, tenantID, platform, subject, deviceKey string, tier uint8) (string, error)
 
 	Now func() time.Time
 }
@@ -2842,10 +3354,11 @@ func NewToken(d TokenDeps) http.Handler {
 		}
 
 		var req trackingv1.TokenRequest
-		// DiscardUnknown is what makes a client-supplied install_id a no-op:
-		// the field does not exist in TokenRequest, so it is dropped here and
-		// can never reach IssueInstall.
-		if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &req); err != nil {
+		// Strict decoding. install_id is not a field of TokenRequest, so a
+		// client that tries to supply one gets a 400 rather than a silently
+		// ignored value — it is the primary rate-limit bucket, and being loud
+		// about the attempt is better than being quietly correct.
+		if err := protojson.Unmarshal(body, &req); err != nil {
 			httpError(w, http.StatusBadRequest, "malformed request")
 			return
 		}
@@ -2856,13 +3369,20 @@ func NewToken(d TokenDeps) http.Handler {
 			return
 		}
 
-		subject, ok := d.Attestor.Verify(r.Context(), req.GetPlatform(), req.GetAttestation())
+		// Tier 0 requires a live, unspent challenge. A replayed attestation
+		// fails the nonce check and falls back to Tier 1 rather than being
+		// rejected — attestation assigns a tier, it never blocks.
 		tier := uint8(1)
-		if ok {
-			tier = 0
+		subject := ""
+		if d.Challenges.Consume(r.Context(), req.GetClientId(), req.GetPlatform(), req.GetChallenge()) {
+			if s, ok := d.Attestor.Verify(
+				r.Context(), req.GetPlatform(), req.GetAttestation(), req.GetChallenge()); ok {
+				subject, tier = s, 0
+			}
 		}
 
-		installID, err := d.IssueInstall(r.Context(), tenantID, req.GetPlatform(), subject, tier)
+		installID, err := d.IssueInstall(
+			r.Context(), tenantID, req.GetPlatform(), subject, deviceKey(r, req), tier)
 		if err != nil {
 			httpError(w, http.StatusServiceUnavailable, "install issuance unavailable")
 			return
@@ -2893,7 +3413,87 @@ func NewToken(d TokenDeps) http.Handler {
 		_, _ = w.Write(out)
 	})
 }
+
+// NewChallenge serves POST /v1/auth/challenge, returning the one-time nonce the
+// client embeds in its attestation.
+func NewChallenge(d TokenDeps) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := readBody(r)
+		if err != nil {
+			httpError(w, http.StatusBadRequest, "unreadable body")
+			return
+		}
+		var req trackingv1.TokenRequest
+		if err := protojson.Unmarshal(body, &req); err != nil {
+			httpError(w, http.StatusBadRequest, "malformed request")
+			return
+		}
+		if _, err := d.ResolveTenant(r.Context(), req.GetClientId()); err != nil {
+			httpError(w, http.StatusUnauthorized, "unknown client_id")
+			return
+		}
+
+		nonce, err := d.Challenges.Issue(r.Context(), req.GetClientId(), req.GetPlatform())
+		if err != nil {
+			httpError(w, http.StatusServiceUnavailable, "challenge unavailable")
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(map[string]string{"challenge": nonce})
+	})
+}
+
+// deviceKey is the Tier 1 install-identity anchor.
+//
+// Without it, a failed attestation leaves subject empty and every exchange
+// mints a fresh install_id — which is the primary rate-limit bucket, so a
+// client could reset its own limit at will just by re-exchanging. Note that
+// Postgres treats NULLs as distinct, so a UNIQUE constraint on a nullable
+// attest_subject does not prevent this on its own.
+//
+// This is a weak anchor by construction: the client supplies device_hint and
+// can rotate it. It is not a security boundary — the tenant-wide daily quota
+// remains the real budget protection. It exists so the *ordinary* Tier 1 client
+// keeps one stable bucket across restarts, and so churning it is at least
+// visible as an anomalous install-creation rate per tenant.
+func deviceKey(r *http.Request, req *trackingv1.TokenRequest) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		req.GetClientId(),
+		req.GetPlatform(),
+		req.GetDeviceHint(),
+	}, "\x00")))
+	return hex.EncodeToString(sum[:])
+}
 ```
+
+Add `device_hint` to `TokenRequest` (field 5): a client-generated, persisted
+random string, the same value across app restarts. Add the imports
+`crypto/sha256`, `encoding/hex`, and `strings`.
+
+**Also fix the `installs` uniqueness constraint** so Tier 1 rows collapse onto
+one install per device key instead of accumulating:
+
+```sql
+ALTER TABLE installs ADD COLUMN device_key TEXT;
+
+-- Two partial unique indexes rather than one UNIQUE over nullable columns:
+-- Postgres treats NULLs as distinct, so the original constraint permitted an
+-- unbounded number of attest_subject IS NULL rows per tenant.
+DROP INDEX IF EXISTS installs_tenant_id_attest_subject_key;
+CREATE UNIQUE INDEX installs_attested
+    ON installs (tenant_id, attest_subject) WHERE attest_subject IS NOT NULL;
+CREATE UNIQUE INDEX installs_unattested
+    ON installs (tenant_id, device_key) WHERE attest_subject IS NULL;
+```
+
+`IssueInstall` then becomes an upsert against whichever index applies, returning
+the existing `install_id` when one is already present.
+
+Additionally, rate-limit the exchange endpoint itself per `(client_id, IP)` —
+`/v1/auth/token` is the one route reachable before an install bucket exists, so
+it needs its own ceiling.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -2910,6 +3510,9 @@ git commit -m "feat(ingest): token exchange with attestation-as-trust-tier"
 ---
 
 ### Task 11: Legacy write-key dual-accept
+
+> **Prerequisite for Task 9** — the batch handler calls `VerifyOrLegacy`. This
+> task depends only on Task 4, so do it before Task 9.
 
 **Files:**
 - Create: `pkg/tenant/legacy.go`
@@ -3088,7 +3691,7 @@ func (v *Verifier) VerifyOrLegacy(ctx context.Context, bearer string, now time.T
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd pkg/tenant && go test ./... -v`
-Expected: PASS, 13 tests.
+Expected: PASS, 17 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -3099,19 +3702,379 @@ git commit -m "feat(tenant): staged legacy write-key cutover with per-tenant cut
 
 ---
 
-### Task 12: Service wiring, config, and end-to-end test
+### Task 12: Control plane, service wiring, and end-to-end test
 
 **Files:**
+- Create: `pkg/controlplane/go.mod`
+- Create: `pkg/controlplane/migrate.go`
+- Create: `pkg/controlplane/store.go`
+- Create: `pkg/controlplane/keys.go`
 - Create: `services/ingest/cmd/main.go`
+- Create: `services/ingest/cmd/jwks.go`
 - Create: `services/ingest/internal/handler/e2e_test.go`
+- Create: `services/ingest/internal/handler/e2e_fixtures_test.go`
+- Create: `deploy/ingest.Dockerfile`
 - Create: `deploy/docker-compose.yml`
 - Modify: `.github/workflows/ci.yml` — add an `ingest` job
 
 **Interfaces:**
 - Consumes: everything above.
-- Produces: a runnable binary; `docker compose up` brings up ClickHouse, Postgres, Redis, and ingest.
+- Produces:
+  - `controlplane.Open(ctx, dsn string) (*pgxpool.Pool, error)`
+  - `controlplane.Migrate(ctx context.Context, pool *pgxpool.Pool, dir fs.FS) error`
+  - `controlplane.New(pool *pgxpool.Pool) *Store` with methods `ResolveTenant`, `IssueInstall`, `LimitsFor`, `ResolveLegacy`, `ActiveSigningKey`, `PublicJWKS`
+  - a runnable binary; `docker compose up` brings up ClickHouse, Postgres, Redis, and ingest.
 
-- [ ] **Step 1: Write the failing end-to-end test**
+- [ ] **Step 1: Write the control plane**
+
+The plan referenced `pgResolveTenant`, `pgIssueInstall`, and `pgLimitsFor`
+without defining them, and created the Postgres schema without a runner. Both
+gaps live here, in a shared package rather than in `services/ingest/cmd`, so the
+query service can reuse read-key resolution.
+
+```bash
+mkdir -p pkg/controlplane pkg/controlplane/sql
+cd pkg/controlplane && go mod init github.com/dhiazfathra/event-tracking/pkg/controlplane
+go get github.com/jackc/pgx/v5@v5.7.1
+cd ../..
+cp migrations/postgres/*.sql pkg/controlplane/sql/
+```
+
+Extend the `sync-migrations` Makefile target to cover this copy too, so it
+cannot go stale:
+
+```makefile
+sync-migrations:
+	rm -rf pkg/clickhouse/sql pkg/controlplane/sql
+	mkdir -p pkg/clickhouse/sql pkg/controlplane/sql
+	cp migrations/clickhouse/*.sql pkg/clickhouse/sql/
+	cp migrations/postgres/*.sql pkg/controlplane/sql/
+	git diff --exit-code -- pkg/clickhouse/sql pkg/controlplane/sql
+```
+
+`pkg/controlplane/migrate.go`:
+
+```go
+// Package controlplane owns the Postgres control plane: tenants, client IDs,
+// read keys, quotas, installs, session offsets, and signing keys.
+package controlplane
+
+import (
+	"context"
+	"embed"
+	"fmt"
+	"io/fs"
+	"sort"
+	"strings"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+//go:embed all:sql
+var embedded embed.FS
+
+var Migrations fs.FS = mustSub(embedded, "sql")
+
+func mustSub(f embed.FS, dir string) fs.FS {
+	sub, err := fs.Sub(f, dir)
+	if err != nil {
+		panic(err)
+	}
+	return sub
+}
+
+func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open postgres: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping postgres: %w", err)
+	}
+	return pool, nil
+}
+
+// Migrate applies each unapplied .sql file exactly once.
+//
+// Unlike the ClickHouse side, each file runs inside a transaction alongside its
+// ledger row — Postgres has transactional DDL, so a failed migration leaves no
+// partial state to reason about.
+func Migrate(ctx context.Context, pool *pgxpool.Pool, dir fs.FS) error {
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			name       TEXT PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`); err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	entries, err := fs.ReadDir(dir, ".")
+	if err != nil {
+		return fmt.Errorf("read migrations: %w", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		body, err := fs.ReadFile(dir, name)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", name, err)
+		}
+
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("begin %s: %w", name, err)
+		}
+
+		var applied bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE name = $1)`, name).
+			Scan(&applied); err != nil {
+			_ = tx.Rollback(ctx)
+			return fmt.Errorf("check %s: %w", name, err)
+		}
+		if applied {
+			_ = tx.Rollback(ctx)
+			continue
+		}
+
+		if _, err := tx.Exec(ctx, string(body)); err != nil {
+			_ = tx.Rollback(ctx)
+			return fmt.Errorf("apply %s: %w", name, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO schema_migrations (name) VALUES ($1)`, name); err != nil {
+			_ = tx.Rollback(ctx)
+			return fmt.Errorf("record %s: %w", name, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit %s: %w", name, err)
+		}
+	}
+	return nil
+}
+```
+
+`pkg/controlplane/store.go`:
+
+```go
+package controlplane
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var ErrNotFound = errors.New("controlplane: not found")
+
+type Store struct{ pool *pgxpool.Pool }
+
+func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+
+// ResolveTenant maps a public client ID to its tenant, rejecting revoked IDs.
+func (s *Store) ResolveTenant(ctx context.Context, clientID string) (string, error) {
+	var tenantID string
+	err := s.pool.QueryRow(ctx,
+		`SELECT tenant_id FROM client_ids WHERE client_id = $1 AND revoked_at IS NULL`,
+		clientID).Scan(&tenantID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return tenantID, err
+}
+
+// IssueInstall returns a stable install identity, creating one on first
+// contact. Both upsert paths target a partial unique index, so a repeated
+// exchange reuses the same install_id rather than minting a fresh rate-limit
+// bucket each time.
+func (s *Store) IssueInstall(ctx context.Context, tenantID, platform, subject, deviceKey string, tier uint8) (string, error) {
+	newID := make([]byte, 16)
+	if _, err := rand.Read(newID); err != nil {
+		return "", fmt.Errorf("install id entropy: %w", err)
+	}
+	candidate := "ins_" + hex.EncodeToString(newID)
+
+	var installID string
+	var err error
+
+	if subject != "" {
+		err = s.pool.QueryRow(ctx, `
+			INSERT INTO installs (install_id, tenant_id, platform, trust_tier, attest_subject, device_key)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (tenant_id, attest_subject) WHERE attest_subject IS NOT NULL
+			DO UPDATE SET trust_tier = EXCLUDED.trust_tier
+			RETURNING install_id`,
+			candidate, tenantID, platform, tier, subject, deviceKey).Scan(&installID)
+	} else {
+		err = s.pool.QueryRow(ctx, `
+			INSERT INTO installs (install_id, tenant_id, platform, trust_tier, attest_subject, device_key)
+			VALUES ($1, $2, $3, $4, NULL, $5)
+			ON CONFLICT (tenant_id, device_key) WHERE attest_subject IS NULL
+			DO UPDATE SET trust_tier = EXCLUDED.trust_tier
+			RETURNING install_id`,
+			candidate, tenantID, platform, tier, deviceKey).Scan(&installID)
+	}
+	if err != nil {
+		return "", fmt.Errorf("issue install: %w", err)
+	}
+	return installID, nil
+}
+
+func (s *Store) LimitsFor(ctx context.Context, tenantID string, tier uint8) (quota.Limits, error) {
+	var lim quota.Limits
+	var rps0, rps1 int
+	err := s.pool.QueryRow(ctx,
+		`SELECT daily_events, rps_tier0, rps_tier1, rps_legacy FROM quotas WHERE tenant_id = $1`,
+		tenantID).Scan(&lim.DailyEvents, &rps0, &rps1, &lim.LegacyRPS)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return quota.Limits{}, ErrNotFound
+	}
+	if err != nil {
+		return quota.Limits{}, err
+	}
+
+	lim.RPS = rps0
+	if tier == 1 {
+		lim.RPS = rps1
+	}
+	return lim, nil
+}
+
+// ResolveLegacy backs tenant.LegacyResolver.
+func (s *Store) ResolveLegacy(ctx context.Context, key string) (string, tenant.LegacyMode, error) {
+	sum := sha256.Sum256([]byte(key))
+
+	var tenantID string
+	var mode string
+	err := s.pool.QueryRow(ctx, `
+		SELECT c.tenant_id, t.legacy_key_mode
+		FROM client_ids c JOIN tenants t USING (tenant_id)
+		WHERE c.client_id = $1 AND c.revoked_at IS NULL`,
+		key).Scan(&tenantID, &mode)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", ErrNotFound
+	}
+	_ = sum
+	return tenantID, tenant.LegacyMode(mode), err
+}
+```
+
+Import `crypto/sha256`, `github.com/dhiazfathra/event-tracking/pkg/tenant`, and
+`github.com/dhiazfathra/event-tracking/services/ingest/internal/quota` — except
+that last one would violate the `pkg/*` may-not-import-`services/*` rule, so
+**move `quota.Limits` to `pkg/limits`** as `limits.Quota` and have both the
+control plane and the quota checker depend on it. `make check-boundaries` fails
+otherwise, which is the rule doing its job.
+
+- [ ] **Step 2: Write the signing-key source**
+
+The exchange minted tokens with an ephemeral in-process key while the verifier
+fetched an external JWKS, so **no token the service issued could verify against
+it**. One key source, published by the same process:
+
+`pkg/controlplane/keys.go`:
+
+```go
+package controlplane
+
+import (
+	"context"
+	"crypto/ed25519"
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/lestrrat-go/jwx/v3/jwk"
+)
+
+type SigningKey struct {
+	KID     string
+	Private ed25519.PrivateKey
+}
+
+// ActiveSigningKey returns the key the minter signs with. Exactly one row is
+// active at a time; rotation flips `active` and leaves the old row in place so
+// its public half stays published and in-flight tokens keep verifying.
+func (s *Store) ActiveSigningKey(ctx context.Context) (SigningKey, error) {
+	var kid string
+	var priv []byte
+	err := s.pool.QueryRow(ctx,
+		`SELECT kid, private_key FROM signing_keys WHERE active AND retired_at IS NULL LIMIT 1`).
+		Scan(&kid, &priv)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return SigningKey{}, ErrNotFound
+	}
+	if err != nil {
+		return SigningKey{}, err
+	}
+	return SigningKey{KID: kid, Private: ed25519.PrivateKey(priv)}, nil
+}
+
+// PublicJWKS returns every non-retired public key, each marked use=sig, which
+// is what the verifier's key-shape check requires.
+func (s *Store) PublicJWKS(ctx context.Context) (jwk.Set, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT kid, public_key FROM signing_keys WHERE retired_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	set := jwk.NewSet()
+	for rows.Next() {
+		var kid string
+		var pub []byte
+		if err := rows.Scan(&kid, &pub); err != nil {
+			return nil, err
+		}
+		key, err := jwk.Import(ed25519.PublicKey(pub))
+		if err != nil {
+			return nil, fmt.Errorf("import %s: %w", kid, err)
+		}
+		_ = key.Set(jwk.KeyIDKey, kid)
+		_ = key.Set(jwk.KeyUsageKey, "sig")
+		if err := set.AddKey(key); err != nil {
+			return nil, err
+		}
+	}
+	return set, rows.Err()
+}
+
+// EnsureSigningKey generates and activates a key when none exists. Called at
+// startup so a fresh environment is usable without a manual provisioning step.
+func (s *Store) EnsureSigningKey(ctx context.Context, kid string) error {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO signing_keys (kid, public_key, private_key, active)
+		SELECT $1, $2, $3, true
+		WHERE NOT EXISTS (SELECT 1 FROM signing_keys WHERE active AND retired_at IS NULL)`,
+		kid, []byte(pub), []byte(priv))
+	return err
+}
+```
+
+`services/ingest/cmd/jwks.go` serves `GET /.well-known/jwks.json` from
+`PublicJWKS`, and `JWKS_URL` defaults to this service's own address. The
+`private_key` column is expected to be encrypted at rest by the deployment
+(KMS/sealed secret) — storing raw Ed25519 seeds in Postgres is acceptable only
+behind that.
+
+- [ ] **Step 3: Write the failing end-to-end test**
 
 `services/ingest/internal/handler/e2e_test.go`:
 
@@ -3134,10 +4097,10 @@ import (
 // A green unit suite can still ship a service that has never written a row.
 func TestExchangeThenIngestThenQuery(t *testing.T) {
 	ctx := context.Background()
-	env := startFullStack(t) // ClickHouse + Redis + wired handlers
+	env := startFullStack(t) // ClickHouse + Postgres + Redis + wired handlers
 
 	tokenRec := postJSON(t, env.Token, "/v1/auth/token",
-		`{"clientId":"pk_live_test","platform":"android","attestation":""}`)
+		`{"clientId":"pk_live_test","platform":"android","deviceHint":"e2e-device"}`)
 	if tokenRec.Code != http.StatusOK {
 		t.Fatalf("token exchange: %d %s", tokenRec.Code, tokenRec.Body)
 	}
@@ -3217,14 +4180,199 @@ func TestReplayIsIdempotent(t *testing.T) {
 	}
 	_ = clickhouse.Row{}
 }
+
+// The exchange and the batch endpoint must agree on one key source. An
+// ephemeral in-process signing key with an externally-fetched JWKS means every
+// token the service issues is rejected by the service itself — and no unit test
+// catches it, because each side passes in isolation.
+func TestExchangedTokenVerifiesAtBatch(t *testing.T) {
+	env := startFullStack(t)
+
+	token := exchangeToken(t, env)
+	rec := postWithToken(t, env.Batch, batchJSON(t, []map[string]any{
+		{"eventId": "0191f4a2-1c3d-7000-8000-0000000000e3", "name": "checkout",
+			"deviceId": "d1", "sessionId": "s1", "tsClient": "1754092800000"},
+	}), token)
+
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatal("a freshly exchanged token was rejected by /v1/batch — the minter and the JWKS disagree")
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("batch: %d %s", rec.Code, rec.Body)
+	}
+}
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [ ] **Step 4: Write the E2E fixtures**
+
+`services/ingest/internal/handler/e2e_fixtures_test.go` (build tag `e2e`).
+Without this the suite references helpers that do not exist and
+`go test -tags e2e` never compiles.
+
+```go
+//go:build e2e
+
+package handler_test
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	chdriver "github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/redis/go-redis/v9"
+
+	trackingv1 "github.com/dhiazfathra/event-tracking/gen/go/tracking/v1"
+	"github.com/dhiazfathra/event-tracking/pkg/clickhouse"
+	"github.com/dhiazfathra/event-tracking/pkg/controlplane"
+	"github.com/dhiazfathra/event-tracking/pkg/tenant"
+	"github.com/dhiazfathra/event-tracking/services/ingest/internal/attest"
+	"github.com/dhiazfathra/event-tracking/services/ingest/internal/enrich"
+	"github.com/dhiazfathra/event-tracking/services/ingest/internal/handler"
+	"github.com/dhiazfathra/event-tracking/services/ingest/internal/quota"
+)
+
+type stack struct {
+	CH    chdriver.Conn
+	Token http.Handler
+	Batch http.Handler
+}
+
+// startFullStack boots ClickHouse, Postgres, and Redis, migrates both schemas,
+// seeds one tenant, and wires the real handlers against them.
+//
+// The JWKS is served from the same store the minter signs with — the whole
+// point of the exchange-then-ingest test is that those two agree.
+func startFullStack(t *testing.T) *stack {
+	t.Helper()
+	ctx := context.Background()
+
+	ch := startClickHouse(t)
+	if err := clickhouse.Migrate(ctx, ch, clickhouse.Migrations); err != nil {
+		t.Fatalf("clickhouse migrate: %v", err)
+	}
+
+	pool := startPostgres(t) // mirrors startClickHouse, using the postgres module
+	if err := controlplane.Migrate(ctx, pool, controlplane.Migrations); err != nil {
+		t.Fatalf("postgres migrate: %v", err)
+	}
+	store := controlplane.New(pool)
+	if err := store.EnsureSigningKey(ctx, "e2e-kid-1"); err != nil {
+		t.Fatalf("signing key: %v", err)
+	}
+	seedTenant(t, pool) // tenant t-test, client_id pk_live_test, generous quotas
+
+	rdb := startRedis(t)
+
+	// JWKS served from the same store, so minted tokens verify.
+	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		set, err := store.PublicJWKS(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(set)
+	}))
+	t.Cleanup(jwks.Close)
+
+	const issuer, audience = "https://issuer.e2e", "https://ingest.e2e"
+
+	key, err := store.ActiveSigningKey(ctx)
+	if err != nil {
+		t.Fatalf("active key: %v", err)
+	}
+	minter := tenant.NewMinter(key.KID, key.Private, issuer, audience, 45*time.Minute)
+	verifier := tenant.NewVerifier(jwks.URL, issuer, audience, jwks.Client())
+
+	tokenDeps := handler.TokenDeps{
+		Minter:        minter,
+		Attestor:      attest.Noop{},
+		Challenges:    attest.RedisChallenges{RDB: rdb, TTL: 5 * time.Minute},
+		ResolveTenant: store.ResolveTenant,
+		IssueInstall:  store.IssueInstall,
+	}
+
+	return &stack{
+		CH:    ch,
+		Token: handler.NewToken(tokenDeps),
+		Batch: handler.NewBatch(handler.Deps{
+			Verifier:  verifier,
+			Legacy:    legacyResolverFunc(store.ResolveLegacy),
+			Offsets:   enrich.NewPostgresOffsetStore(pool),
+			Quota:     quota.NewChecker(rdb),
+			LimitsFor: store.LimitsFor,
+			Insert: func(ctx context.Context, rows []clickhouse.Row) error {
+				return clickhouse.InsertEvents(ctx, ch, rows)
+			},
+		}),
+	}
+}
+
+// exchangeToken runs the real exchange and returns the access token.
+func exchangeToken(t *testing.T, env *stack) string {
+	t.Helper()
+	rec := postJSON(t, env.Token, "/v1/auth/token",
+		`{"clientId":"pk_live_test","platform":"android","deviceHint":"e2e-device"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("token exchange: %d %s", rec.Code, rec.Body)
+	}
+	var tok trackingv1.TokenResponse
+	decode(t, rec.Body.Bytes(), &tok)
+	return tok.AccessToken
+}
+
+func postWithToken(t *testing.T, h http.Handler, body []byte, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	return postWithAuth(t, h, body, "Bearer "+token)
+}
+```
+
+`enrich.NewPostgresOffsetStore(pool)` is the persistent `OffsetStore` backing
+the `session_offsets` table — `MemoryOffsetStore` must not be used outside
+tests, since it loses offsets on restart and disagrees across replicas, which
+breaks the stable-`ts` guarantee that read-time dedup depends on:
+
+```go
+// PostgresOffsetStore persists first-contact offsets so a retry lands on the
+// same ts as the original — across restarts and across pods.
+type PostgresOffsetStore struct{ pool *pgxpool.Pool }
+
+func NewPostgresOffsetStore(pool *pgxpool.Pool) *PostgresOffsetStore {
+	return &PostgresOffsetStore{pool: pool}
+}
+
+// GetOrSet is a single atomic upsert-returning: two concurrent first requests
+// for one session agree on one value. If they disagreed, the two events would
+// land at different ts and neither would deduplicate against its own retry.
+func (s *PostgresOffsetStore) GetOrSet(ctx context.Context, k SessionKey, candidate int64) (int64, error) {
+	var offset int64
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO session_offsets (tenant_id, device_id, session_id, offset_ms)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (tenant_id, device_id, session_id)
+		DO UPDATE SET offset_ms = session_offsets.offset_ms
+		RETURNING offset_ms`,
+		k.TenantID, k.DeviceID, k.SessionID, candidate).Scan(&offset)
+	if err != nil {
+		return 0, fmt.Errorf("session offset: %w", err)
+	}
+	return offset, nil
+}
+```
+
+The no-op `DO UPDATE` is deliberate: `ON CONFLICT DO NOTHING` returns no row, so
+there would be nothing to read back.
+
+- [ ] **Step 5: Run it to verify it fails**
 
 Run: `cd services/ingest && go test -tags e2e ./internal/handler/...`
-Expected: FAIL — `undefined: startFullStack`.
+Expected: FAIL — `undefined: handler.NewBatch` wiring or a missing `main.go`
+symbol, not an undefined fixture.
 
-- [ ] **Step 3: Write `main.go`**
+- [ ] **Step 6: Write `main.go`**
 
 `services/ingest/cmd/main.go`:
 
@@ -3274,35 +4422,97 @@ func main() {
 	}
 	defer conn.Close()
 
+	pool, err := controlplane.Open(ctx, env("POSTGRES_DSN", "postgres://postgres:dev@localhost:5432/control"))
+	if err != nil {
+		log.Error("postgres", "err", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	// Migrations run before the service serves traffic, not from a sidecar:
+	// a pod that came up against an un-migrated schema fails every request.
+	if err := controlplane.Migrate(ctx, pool, controlplane.Migrations); err != nil {
+		log.Error("postgres migrate", "err", err)
+		os.Exit(1)
+	}
+	if err := clickhouse.Migrate(ctx, conn, clickhouse.Migrations); err != nil {
+		log.Error("clickhouse migrate", "err", err)
+		os.Exit(1)
+	}
+
+	store := controlplane.New(pool)
+
 	rdb := redis.NewClient(&redis.Options{Addr: env("REDIS_ADDR", "localhost:6379")})
 	defer rdb.Close()
 
 	issuer := env("TOKEN_ISSUER", "https://issuer.local")
 	audience := env("TOKEN_AUDIENCE", "https://ingest.local")
 
-	priv, kid := loadSigningKey(log)
-	minter := tenant.NewMinter(kid, priv, issuer, audience, 45*time.Minute)
-	verifier := tenant.NewVerifier(env("JWKS_URL", issuer+"/.well-known/jwks.json"), issuer, audience, nil)
+	// One key source for both minting and publication. An ephemeral key with an
+	// externally-fetched JWKS means the service rejects its own tokens.
+	if err := store.EnsureSigningKey(ctx, env("SIGNING_KID", "kid-1")); err != nil {
+		log.Error("ensure signing key", "err", err)
+		os.Exit(1)
+	}
+	key, err := store.ActiveSigningKey(ctx)
+	if err != nil {
+		log.Error("active signing key", "err", err)
+		os.Exit(1)
+	}
+
+	minter := tenant.NewMinter(key.KID, key.Private, issuer, audience, 45*time.Minute)
+	verifier := tenant.NewVerifier(
+		env("JWKS_URL", "http://127.0.0.1"+env("LISTEN_ADDR", ":8080")+"/.well-known/jwks.json"),
+		issuer, audience, nil)
 
 	checker := quota.NewChecker(rdb)
 
-	mux := http.NewServeMux()
-	mux.Handle("POST /v1/auth/token", handler.NewToken(handler.TokenDeps{
+	tokenDeps := handler.TokenDeps{
 		Minter:        minter,
 		Attestor:      attest.Noop{},
-		ResolveTenant: pgResolveTenant(ctx),
-		IssueInstall:  pgIssueInstall(ctx),
-	}))
+		Challenges:    attest.RedisChallenges{RDB: rdb, TTL: 5 * time.Minute},
+		ResolveTenant: store.ResolveTenant,
+		IssueInstall:  store.IssueInstall,
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("POST /v1/auth/challenge", handler.NewChallenge(tokenDeps))
+	mux.Handle("POST /v1/auth/token", handler.NewToken(tokenDeps))
+	mux.Handle("GET /.well-known/jwks.json", newJWKSHandler(store))
 	mux.Handle("POST /v1/batch", handler.NewBatch(handler.Deps{
-		Verifier:  verifier,
-		Offsets:   enrich.NewMemoryOffsetStore(),
+		Verifier: verifier,
+		Legacy:   legacyResolver{store},
+		// Persistent, not in-memory: an offset that changes across a restart or
+		// differs per replica gives a retry a different ts than its original,
+		// which stops ReplacingMergeTree from ever collapsing the pair.
+		Offsets:   enrich.NewPostgresOffsetStore(pool),
 		Quota:     checker,
-		LimitsFor: pgLimitsFor(ctx),
+		LimitsFor: store.LimitsFor,
 		Insert: func(ctx context.Context, rows []clickhouse.Row) error {
 			return clickhouse.InsertEvents(ctx, conn, rows)
 		},
+		OnLegacyUse: func(tenantID, sdkVersion string) {
+			log.Warn("legacy write key used", "tenant", tenantID, "sdk_version", sdkVersion)
+		},
 	}))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	// Readiness is distinct from liveness: compose and Kubernetes need to know
+	// the dependencies are actually reachable, not just that the process is up.
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		if err := conn.Ping(r.Context()); err != nil {
+			http.Error(w, "clickhouse", http.StatusServiceUnavailable)
+			return
+		}
+		if err := pool.Ping(r.Context()); err != nil {
+			http.Error(w, "postgres", http.StatusServiceUnavailable)
+			return
+		}
+		if err := rdb.Ping(r.Context()).Err(); err != nil {
+			http.Error(w, "redis", http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -3310,8 +4520,15 @@ func main() {
 		Addr:              env("LISTEN_ADDR", ":8080"),
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
-		// Generous: wait_for_async_insert=1 can add ~1s, and a slow mobile
-		// upload on a bad connection is normal, not an attack.
+		// ReadHeaderTimeout does not bound the body. Without ReadTimeout a
+		// client can hold a connection open indefinitely, dribbling bytes —
+		// cheap for the attacker, one goroutine and one FD each for us.
+		//
+		// 60s is generous for a <=1 MB gzipped batch even on a bad mobile
+		// connection, which is the documented upload behaviour.
+		ReadTimeout: 60 * time.Second,
+		IdleTimeout: 120 * time.Second,
+		// Generous: wait_for_async_insert=1 can add ~1s.
 		WriteTimeout: 30 * time.Second,
 	}
 
@@ -3336,25 +4553,90 @@ func env(k, def string) string {
 	return def
 }
 
-func loadSigningKey(log *slog.Logger) (ed25519.PrivateKey, string) {
-	// Reads the active signing key from Postgres in production. For local dev,
-	// generate an ephemeral one — tokens do not need to survive a restart.
-	_, priv, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		log.Error("keygen", "err", err)
-		os.Exit(1)
-	}
-	return priv, "dev-kid-1"
+// legacyResolver adapts the control-plane store to tenant.LegacyResolver.
+type legacyResolver struct{ store *controlplane.Store }
+
+func (l legacyResolver) Resolve(ctx context.Context, key string) (string, tenant.LegacyMode, error) {
+	return l.store.ResolveLegacy(ctx, key)
 }
 ```
 
-`pgResolveTenant`, `pgIssueInstall`, and `pgLimitsFor` are thin `pgx` queries
-against the Task 3 schema. Write them in `services/ingest/cmd/postgres.go`;
-each is a single `QueryRow` with the SQL inlined.
+`services/ingest/cmd/jwks.go`:
 
-- [ ] **Step 4: Write the compose file**
+```go
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/dhiazfathra/event-tracking/pkg/controlplane"
+)
+
+// newJWKSHandler publishes the public half of every non-retired signing key.
+//
+// Serving this from the same process that mints is what makes an exchanged
+// token verifiable at /v1/batch. Cached briefly: the verifier has its own TTL,
+// and rotation overlaps keys, so a few seconds of staleness is harmless.
+func newJWKSHandler(store *controlplane.Store) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		set, err := store.PublicJWKS(r.Context())
+		if err != nil {
+			http.Error(w, "jwks unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/jwk-set+json")
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		_ = json.NewEncoder(w).Encode(set)
+	})
+}
+```
+
+Drop the `crypto/ed25519` import from `main.go` — the key now comes from the
+control plane — and add `pkg/controlplane`.
+
+- [ ] **Step 7: Write the Dockerfile and compose file**
+
+`deploy/ingest.Dockerfile` — the compose file referenced it but the plan never
+created it, so `docker compose build ingest` failed on a clean checkout:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+
+# The workspace spans several modules, so the whole tree is needed to resolve
+# the `use` directives. Copy go.work first for layer caching.
+COPY go.work go.work.sum* ./
+COPY gen/ gen/
+COPY pkg/ pkg/
+COPY services/ services/
+COPY tools/ tools/
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/ingest ./services/ingest/cmd
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/ingest /ingest
+USER nonroot:nonroot
+EXPOSE 8080
+ENTRYPOINT ["/ingest"]
+```
+
+`deploy/query.Dockerfile` is identical apart from the build target
+(`./services/query/cmd`) and the exposed port (8081); plan 3 Task 7 assumes it
+exists.
+
+- [ ] **Step 8: Write the compose file**
 
 `deploy/docker-compose.yml`:
+
+```yaml
+Plain `depends_on` only orders container *start*, not readiness — ingest would
+race ClickHouse's first boot and exit. Each dependency gets a healthcheck and a
+`service_healthy` condition. Schema migrations run inside `main` at startup
+(Step 6), so there is no separate migration container to sequence.
 
 ```yaml
 services:
@@ -3365,6 +4647,12 @@ services:
     ports: ["8123:8123", "9000:9000"]
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
 
   postgres:
     image: postgres:16-alpine
@@ -3372,10 +4660,20 @@ services:
       POSTGRES_DB: control
       POSTGRES_PASSWORD: dev
     ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d control"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   ingest:
     build:
@@ -3383,13 +4681,18 @@ services:
       dockerfile: deploy/ingest.Dockerfile
     environment:
       CLICKHOUSE_ADDRS: clickhouse:9000
+      CLICKHOUSE_DB: tracking
+      POSTGRES_DSN: postgres://postgres:dev@postgres:5432/control
       REDIS_ADDR: redis:6379
       LISTEN_ADDR: ":8080"
     ports: ["8080:8080"]
-    depends_on: [clickhouse, postgres, redis]
+    depends_on:
+      clickhouse: { condition: service_healthy }
+      postgres:   { condition: service_healthy }
+      redis:      { condition: service_healthy }
 ```
 
-- [ ] **Step 5: Add the CI job**
+- [ ] **Step 9: Add the CI job**
 
 Append to `.github/workflows/ci.yml`:
 
@@ -3402,23 +4705,33 @@ Append to `.github/workflows/ci.yml`:
         with:
           go-version: '1.23'
       - name: Unit tests
-        run: cd services/ingest && go test ./...
+        run: cd services/ingest && go test -race ./...
       - name: Integration tests
         run: |
           cd pkg/clickhouse && go test ./...
+          cd ../controlplane && go test ./...
           cd ../../services/ingest && go test -tags e2e ./...
+      - name: Compose stack builds
+        run: docker compose -f deploy/docker-compose.yml build ingest
 ```
 
-- [ ] **Step 6: Run everything**
+- [ ] **Step 10: Run everything**
 
-Run: `go build ./... && cd services/ingest && go test ./... && go test -tags e2e ./...`
-Expected: build clean, all tests PASS.
+Run:
+```bash
+make sync-migrations
+go build ./... && go run ./tools/checkboundaries
+cd services/ingest && go test -race ./... && go test -tags e2e ./...
+docker compose -f ../../deploy/docker-compose.yml up -d --wait && docker compose -f ../../deploy/docker-compose.yml down
+```
+Expected: build clean, all tests PASS, boundaries OK, and `--wait` returns
+without timing out — which is what proves the healthchecks are wired.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
-git add services/ingest deploy .github/workflows/ci.yml go.work
-git commit -m "feat(ingest): wire the service, add compose stack and e2e tests"
+git add pkg/controlplane services/ingest deploy .github/workflows/ci.yml go.work Makefile
+git commit -m "feat(ingest): wire the service, control plane, compose stack, and e2e tests"
 ```
 
 ---
@@ -3525,11 +4838,21 @@ git commit -m "docs(ingest): document the status contract, durability, and trust
 
 ## Completion criteria
 
-- `go test ./...` and `go test -tags e2e ./services/ingest/...` pass.
+- `go test -race ./...` and `go test -tags e2e ./services/ingest/...` pass.
 - `golangci-lint run ./...` clean.
-- `make check-boundaries` passes — ingest imports no other service.
+- `make check-boundaries` passes — ingest imports no other service, and
+  `pkg/controlplane` imports no service package.
+- `docker compose -f deploy/docker-compose.yml up -d --wait` returns cleanly.
 - A batch containing one poison event returns `200` with a per-event reject and
   stores the rest.
 - Replaying an identical batch three times leaves one row after `OPTIMIZE FINAL`.
-- A token with `alg: none`, an HMAC signature, a wrong `aud`, a wrong `iss`, a
-  missing scope, or an unknown `kid` is rejected with `401`.
+- A token minted by `/v1/auth/token` verifies at `/v1/batch` — the minter and
+  the published JWKS share one key source.
+- A token with `alg: none`, an HMAC signature, an audience list that merely
+  contains the ingest audience, a wrong `iss`, a missing scope, a missing or
+  out-of-range `trust_tier`, a JWKS key without `use: "sig"`, or an unknown
+  `kid` is rejected with `401`.
+- Concurrent `Allow` calls never grant more than the daily budget, and the
+  stored counter matches what was granted.
+- Repeated Tier 1 exchanges from one device reuse a single `install_id`.
+- An oversized body returns `413` whether or not it was gzipped.
