@@ -76,11 +76,11 @@ JWT signed so the ingest edge verifies with a public key and holds no shared sec
 | `tenant_id` | Required, non-empty. The sole source of tenant identity (see §5) |
 | `install_id` | Required, non-empty. Server-issued (see §4) |
 | `trust_tier` | Required. `0` or `1` |
-| `kid` | Required. Must resolve to a current key in the JWKS |
+| `kid` | Required. Must resolve to a current key in the JWKS whose `use` is `sig` and whose type is Ed25519-compatible (`kty: OKP`, `crv: Ed25519`). A key published for encryption, or of any other type, is rejected even if the signature would verify |
 
 Signature verification alone is not acceptance — a valid signature with `scope=write:events` does not bind a token to *this* endpoint without the `iss` and `aud` checks.
 
-**JWKS handling.** Public keys are fetched from a JWKS endpoint and cached with a bounded TTL. Rotation publishes the new key alongside the old with overlapping validity, so tokens signed before the rotation stay verifiable until they expire naturally. A `kid` miss triggers at most one out-of-cycle refetch, rate-limited, so an attacker cannot force unbounded JWKS traffic with forged `kid` values. Retired keys are removed only after the longest possible token lifetime has elapsed.
+**JWKS handling.** Public keys are fetched from a JWKS endpoint and cached with a bounded TTL. Key selection validates intent, not just identity: the resolved key must carry `use: "sig"` and `kty: "OKP"` with `crv: "Ed25519"`, and anything else is a `401`. Skipping that check is how a key published for a different purpose ends up trusted for ingest authorization. Rotation publishes the new key alongside the old with overlapping validity, so tokens signed before the rotation stay verifiable until they expire naturally. A `kid` miss triggers at most one out-of-cycle refetch, rate-limited, so an attacker cannot force unbounded JWKS traffic with forged `kid` values. Retired keys are removed only after the longest possible token lifetime has elapsed.
 
 ### 4. Rate limits keyed on `install_id` first, tenant second, IP last
 

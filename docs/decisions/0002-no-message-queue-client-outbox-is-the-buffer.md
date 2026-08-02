@@ -16,6 +16,8 @@ This platform targets ~1k events/sec (~86M/day). Every client is a Flutter SDK w
 
 The question is whether a server-side durable buffer earns its operational cost when every producer already has one.
 
+Note on terminology throughout this ADR: the client outbox is **crash-safe on-disk retention**, not full durability. It survives process crashes and app restarts, but under `synchronous=NORMAL` (ADR-0005) it can lose the most recent commits to a power cut or kernel panic, and it is bounded in size and retry budget. Where this document says the outbox provides "durability", read it in that qualified sense.
+
 ## Decision
 
 Do not deploy Kafka or an equivalent. The ingest service writes directly to ClickHouse using `async_insert=1, wait_for_async_insert=1`. When ClickHouse is unavailable, ingest returns `503` and clients retain the events in their outboxes.

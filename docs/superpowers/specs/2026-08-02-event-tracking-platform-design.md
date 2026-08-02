@@ -24,7 +24,7 @@ These four answers drove every decision below. If one changes, re-read this docu
 │  Flutter app + SDK       │
 │  ┌────────────────────┐  │
 │  │ drift / SQLite     │  │
-│  │  outbox            │  │  append-only, durable
+│  │  outbox            │  │  append-only, crash-safe
 │  │  query_cache       │  │  read-through, etag
 │  └────────────────────┘  │
 └────────┬─────────────▲───┘
@@ -62,7 +62,7 @@ These four answers drove every decision below. If one changes, re-read this docu
 └──────────────────────────────────────┘
 ```
 
-**The load-bearing idea:** the client's durable outbox *is* the ingestion queue. Because every phone holds its own unsent events on disk and retries with backoff, the backend does not need a separate durable buffer tier. ClickHouse down means the ingest service returns `503`, the client keeps the events, and they arrive later. This is what lets a multi-tenant ingestion platform run without Kafka at this scale.
+**The load-bearing idea:** the client's on-disk outbox *is* the ingestion queue. Because every phone holds its own unsent events on disk and retries with backoff, the backend does not need a separate durable buffer tier. ("On-disk" rather than "durable" is deliberate: the outbox survives process crashes but not power loss in the seconds after a capture — see §4.2.) ClickHouse down means the ingest service returns `503`, the client keeps the events, and they arrive later. This is what lets a multi-tenant ingestion platform run without Kafka at this scale.
 
 **Data flow, write path:**
 1. App calls `Tracker.track(name, props)`.
@@ -378,7 +378,7 @@ POST /v1/batch               ← Authorization: Bearer <JWT>
    ingest verifies via JWKS public key — holds no shared secret
 ```
 
-**Acceptance is not just signature verification.** Ingest rejects with `401` unless every one of these holds: `alg` is `EdDSA` (checked against an allowlist before verification — `none` and all HMAC algorithms rejected outright, never inferred from the token header), `typ` is `at+jwt`, `iss` matches the platform issuer exactly, `aud` matches the ingest audience exactly, `exp`/`nbf` are valid within ≤60s skew, `scope` contains `write:events`, and `kid` resolves in the JWKS. A valid signature alone does not bind a token to this endpoint — the `iss`/`aud` checks are what stop a token minted for another audience from being replayed here. JWKS keys are cached with a bounded TTL; rotation overlaps old and new so in-flight tokens stay verifiable, and a `kid` miss triggers at most one rate-limited refetch so forged `kid` values can't drive unbounded JWKS traffic.
+**Acceptance is not just signature verification.** Ingest rejects with `401` unless every one of these holds: `alg` is `EdDSA` (checked against an allowlist before verification — `none` and all HMAC algorithms rejected outright, never inferred from the token header), `typ` is `at+jwt`, `iss` matches the platform issuer exactly, `aud` matches the ingest audience exactly, `exp`/`nbf` are valid within ≤60s skew, `scope` contains `write:events`, and `kid` resolves in the JWKS to a key marked `use: "sig"` with `kty: "OKP"` / `crv: "Ed25519"` (a key published for any other purpose or type is rejected even if the signature would verify). A valid signature alone does not bind a token to this endpoint — the `iss`/`aud` checks are what stop a token minted for another audience from being replayed here. JWKS keys are cached with a bounded TTL; rotation overlaps old and new so in-flight tokens stay verifiable, and a `kid` miss triggers at most one rate-limited refetch so forged `kid` values can't drive unbounded JWKS traffic.
 
 - **Attestation runs at the exchange, not at ingest.** Ingest stays a hot path that only verifies a signature. Bundle-ID and origin headers are kept as telemetry, never as a control — `curl` sets them.
 - **Attestation failure does not block; it assigns a trust tier.** Tier 0 (attested) gets normal rate limits. Tier 1 (attestation unavailable) gets tighter rate limits — **not** sampling. Rooted, custom-ROM, and de-Googled devices fail attestation *legitimately*; simulators fail; Play Integrity is quota-limited. Blocking would buy little and cost real users. Sampling was rejected because silently discarding an event behind a `200` destroys it: the client deletes the outbox row on acknowledgement, so there is no retry and no counter. Rate limiting returns `429`, which the SDK already backs off on and which degrades into ordinary counted loss. Same cost control, no hole in the guarantee.
@@ -545,7 +545,7 @@ An opt-in `optimistic: true` mode is available, which surfaces the pending count
 
 **Ingestion** — `wait_for_async_insert=1` trades up to ~1s of p99 latency for the ability to honestly claim durability on a `200`. Partial-success responses add response-shape complexity but eliminate the poison-pill outage class.
 
-**No Kafka** — saves an entire cluster and its operational surface, and works because the client outbox already provides durability. Costs: no stream replay after a bad deploy, no second consumer, and ClickHouse downtime surfaces to clients as `503` (absorbed by the outbox, but visible in error metrics). Named triggers for adding it are in §3.8.
+**No Kafka** — saves an entire cluster and its operational surface, and works because the client outbox already provides crash-safe on-disk retention (bounded, and not power-loss durable — §4.2). Costs: no stream replay after a bad deploy, no second consumer, and ClickHouse downtime surfaces to clients as `503` (absorbed by the outbox, but visible in error metrics). Named triggers for adding it are in §3.8.
 
 **ClickHouse ordering key** — `(tenant_id, name, ts, event_id)` optimizes the dominant dashboard query and makes tenant isolation a key-prefix property. It penalizes per-user queries that do not pin an event name. The `by_user` projection fixes that at roughly 2× storage and is deliberately deferred.
 
@@ -557,7 +557,7 @@ An opt-in `optimistic: true` mode is available, which surfaces the pending count
 
 **drift over Isar** — migration safety and transactional semantics over raw write throughput, for a dependency that ships inside third parties' apps and cannot be hot-fixed. Costs `build_runner` in the SDK build.
 
-**No client-side event buffer** — every event is durable the moment it is captured, including the ones immediately preceding a crash. Costs one SQLite write per event instead of one per batch; WAL mode makes this cheap enough not to matter.
+**No client-side event buffer** — every event is committed to disk the moment it is captured, including the ones immediately preceding an application crash. Costs one SQLite write per event instead of one per batch; WAL mode makes this cheap enough not to matter. Not power-loss durable under `synchronous=NORMAL` (§4.2) — an in-memory buffer would widen that window from seconds to the full flush interval *and* add process-crash loss on top.
 
 **Bounded outbox (10k)** — protects the host app's storage, at the cost of losing the oldest events for very long offline periods. Made visible via a dropped-event counter rather than silently discarded.
 
