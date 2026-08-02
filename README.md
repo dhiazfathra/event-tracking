@@ -20,6 +20,7 @@ It covers the high-level architecture, monorepo layout and module boundaries, th
 | [0004](docs/decisions/0004-at-least-once-delivery-with-dedup-on-read.md) | At-least-once delivery with deduplication on read |
 | [0005](docs/decisions/0005-drift-sqlite-for-client-outbox.md) | drift (SQLite) for the Flutter client outbox |
 | [0006](docs/decisions/0006-constrained-query-dsl-not-sql-passthrough.md) | Constrained query DSL instead of SQL passthrough |
+| [0007](docs/decisions/0007-public-client-id-and-short-lived-ingest-tokens.md) | Public client ID and short-lived ingest tokens |
 
 Decisions are not deleted when they change. Supersede them with a new ADR that references the old one.
 

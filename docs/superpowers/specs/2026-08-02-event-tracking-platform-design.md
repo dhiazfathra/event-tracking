@@ -9,7 +9,7 @@ These four answers drove every decision below. If one changes, re-read this docu
 
 | Constraint | Value | Consequence |
 |---|---|---|
-| Tenancy | Third-party SaaS | Write keys, server-derived `tenant_id`, per-tenant quotas, untrusted clients |
+| Tenancy | Third-party SaaS | Public client ID exchanged for short-lived scoped tokens (§3.9), server-derived `tenant_id`, per-tenant quotas, untrusted clients |
 | Scale target | ~1k events/sec (~86M/day, ~2.6B/month) | No Kafka. ClickHouse async inserts are the buffer |
 | Delivery | At-least-once until exhaustion, then bounded loss | Client retries freely; `uniqExact(event_id)` at query time. Retry exhaustion (`dead`) and outbox overflow are intentional, counted data loss — not "never lost" |
 | Client sync | Events + local query cache | Append-only writes (no conflicts) + a read-through cache (server authoritative) |
@@ -51,12 +51,14 @@ These four answers drove every decision below. If one changes, re-read this docu
 
 ┌──────────────────────────────────────┐
 │  Postgres (control plane)            │
-│   tenants, write_keys, read_keys,    │
-│   quotas, event schema registry      │
+│   tenants, client_ids, read_keys,    │
+│   JWKS signing keys, quotas,         │
+│   event schema registry              │
 └──────────────────────────────────────┘
 
 ┌──────────────────────────────────────┐
-│  Redis — quota counters, key cache   │
+│  Redis — quota + rate-limit counters │
+│          (install_id keyed), JWKS    │
 └──────────────────────────────────────┘
 ```
 
@@ -67,7 +69,7 @@ These four answers drove every decision below. If one changes, re-read this docu
 2. SDK assigns `event_id` (UUID v7) and a per-device monotonic `seq`, writes one row to SQLite, returns. Never blocks, never throws into app code.
 3. A flush trigger (timer / threshold / lifecycle / connectivity regain) claims up to 500 pending rows in a transaction and marks them `inflight`.
 4. `POST /v1/batch` with gzip.
-5. Ingest authenticates the write key, resolves `tenant_id`, validates, corrects clock skew, checks quota, inserts to ClickHouse with `async_insert=1, wait_for_async_insert=1`.
+5. Ingest verifies the JWT signature (§3.9), reads `tenant_id`/`trust_tier` from its claims, validates, corrects clock skew, checks quota, inserts to ClickHouse with `async_insert=1, wait_for_async_insert=1`.
 6. Response reports accepted IDs and per-event rejects. Client deletes accepted, marks rejects `dead`, returns the rest to `pending` with backoff.
 
 **Data flow, read path:**
@@ -165,7 +167,7 @@ message Event {
 }
 ```
 
-`tenant_id` is deliberately absent. It is resolved server-side from the write key. A client-supplied tenant field is a cross-tenant write primitive.
+`tenant_id` is deliberately absent. It is read server-side from the verified token's `tenant_id` claim (§3.9). A client-supplied tenant field is a cross-tenant write primitive.
 
 UUID v7 rather than v4: time-ordered UUIDs cluster in the ORDER BY tail and compress far better than random ones, and give a usable secondary sort when two events share a millisecond.
 
@@ -173,7 +175,7 @@ UUID v7 rather than v4: time-ordered UUIDs cluster in the ORDER BY tail and comp
 
 ```http
 POST /v1/batch
-Authorization: Bearer wk_live_...
+Authorization: Bearer <short-lived JWT, see §3.9>
 Content-Encoding: gzip
 Content-Type: application/json
 
@@ -200,7 +202,7 @@ Response is **always partial-success shaped**:
 |---|---|---|
 | `200` | Batch processed (may contain rejects) | Delete accepted, mark rejected `dead` |
 | `400` | Batch envelope malformed | Drop batch, do not retry |
-| `401` | Bad write key | Stop syncing, surface to host app |
+| `401` | Token expired or invalid | Re-exchange for a fresh token (§3.9) and retry once; if the exchange itself fails, stop syncing and surface to host app |
 | `413` | Batch too large | Halve batch size, retry. If the batch is already a single event, mark that event `dead` and continue — see below |
 | `429` | Quota or rate limit | Retry after `Retry-After` |
 | `5xx` | Server or ClickHouse fault | Retry with backoff |
@@ -210,7 +212,8 @@ Response is **always partial-success shaped**:
 
 ### 3.3 Enrichment and trust
 
-- **`tenant_id`** — from the write key. Cached in-process, 60s TTL, negative-cached to survive credential-stuffing.
+- **`tenant_id`** — from the verified JWT's `tenant_id` claim (§3.9), not from a database lookup on the hot path and never from the request body.
+- **`trust_tier`** — from the JWT's `trust_tier` claim, persisted on every row. Tier 1 traffic is sampled at ingest.
 - **Clock skew correction** — `ts = ts_client + (received_at_server − sent_at_client)`. Mobile clocks are wrong by minutes to years. Both `ts_client` (raw) and `ts` (corrected) are stored; `ts` is what queries use.
 - **Skew clamp** — corrected timestamps more than 24h in the future or 30d in the past are clamped to `received_at` and flagged. Without this a single device with a broken clock creates partitions years out and wrecks the partition count.
 - **`ts_received`** — server-set, also the `ReplacingMergeTree` version column.
@@ -253,6 +256,9 @@ CREATE TABLE events
     os            LowCardinality(String),
     os_version    LowCardinality(String),
     locale        LowCardinality(String),
+
+    trust_tier    UInt8,                  -- 0 = attested, 1 = attestation unavailable (§3.9)
+    install_id    String,                 -- from the JWT; rate-limit and quarantine key
 
     props         JSON,
 
@@ -340,6 +346,35 @@ The design is honest about what it is: a single-cluster design sized for the sta
 **Shard pruning is conditional, not automatic.** `tenant_id` leading the sort key does not by itself make a `Distributed` table skip shards. Skipping requires all three: data actually distributed by `cityHash64(tenant_id)`, `optimize_skip_unused_shards` enabled, and the query filtering on `tenant_id` (which it always does, per ADR-0006). Verify with `EXPLAIN` or a cluster test before relying on it — a misconfigured cluster where these don't line up silently falls back to scatter-gather, or worse, produces wrong results if the setting is on but the distribution isn't consistent with the sharding key.
 
 **Why Kafka is absent at the start:** at 1k eps it buys a buffer the system already has (the client outbox) at the price of a second cluster, a consumer service, partition/offset/lag operations, and a rebalance failure mode. The three things that genuinely justify it — replay after a bad deploy, multiple consumers of the raw stream, and accepting writes while ClickHouse is down — are all either absent or already solved by the client holding its own events. Listed as triggers rather than built now.
+
+### 3.9 Ingest authentication
+
+Full rationale in [ADR-0007](../../decisions/0007-public-client-id-and-short-lived-ingest-tokens.md). The short version:
+
+**The identifier embedded in the SDK is a public client ID, not a secret.** Anything shipped inside a third party's mobile binary is extractable — that is a certainty, not a risk. So the embedded value identifies a tenant and authorizes nothing, and its extraction is designed to be boring.
+
+```text
+app start
+   │
+   ▼
+POST /v1/auth/token          ← client_id + platform attestation
+   │                            (App Attest / Play Integrity)
+   ▼
+JWT (ES256/EdDSA, exp 30–60m)
+   claims: tenant_id, install_id, scope=write:events, trust_tier
+   │
+   ▼
+POST /v1/batch               ← Authorization: Bearer <JWT>
+   ingest verifies signature via JWKS public key — holds no shared secret
+```
+
+- **Attestation runs at the exchange, not at ingest.** Ingest stays a hot path that only verifies a signature. Bundle-ID and origin headers are kept as telemetry, never as a control — `curl` sets them.
+- **Attestation failure does not block; it assigns a trust tier.** Tier 0 (attested) gets normal limits. Tier 1 (attestation unavailable) gets tight limits and sampled ingestion. Rooted, custom-ROM, and de-Googled devices fail attestation *legitimately*; simulators fail; Play Integrity is quota-limited. Blocking would buy little and cost real users.
+- **Rate limits key on `install_id` first, tenant second, IP last.** IP-primary limiting is actively harmful here: Indonesian carriers CGNAT aggressively, so one Telkomsel egress IP is thousands of real users. IP survives only as a coarse anomaly signal. The per-tenant cap remains as budget protection — one abused tenant must not consume the whole ingestion spend.
+- **`write:events` means exactly that.** No reads, no enumeration, no cross-tenant. The worst case of a fully abused pipeline is cost plus data pollution, never exfiltration — which is also the PDP Law argument, since a stolen write token cannot reach *data spesifik*.
+- **Rotation is not an abuse control.** Rotating an embedded identifier costs a release and a forced-upgrade cycle — weeks. It is an incident-response lever only. The token is the thing that expires.
+
+This replaces the earlier `Authorization: Bearer wk_live_...` scheme in §3.2; the existing write key becomes the bootstrap client ID.
 
 ---
 
@@ -484,7 +519,7 @@ An opt-in `optimistic: true` mode is available, which surfaces the pending count
 1. **Retention tiering** — 13 months of raw events at 1k eps is roughly 2.6B rows/month. Is 13 months of *raw* retention actually required, or would raw-90-days plus rollups-13-months be acceptable? This materially changes storage cost and the TTL design.
 2. **GDPR/CCPA deletion** — per-user deletion requires an `ALTER TABLE ... DELETE` mutation, which rewrites parts and is slow at scale. Options: accept mutation cost, batch deletions into a weekly window, or add a `deleted_users` join-filter table that the query layer applies. Needs a decision before the first deletion request, not after.
 3. **Schema registry enforcement** — should unknown event names or unexpected property types be rejected at ingest, or accepted and flagged? Rejection keeps the data clean; acceptance keeps a customer's release from silently losing telemetry. A per-tenant strict/lenient mode is probably the answer but adds configuration surface.
-4. **SDK key rotation** — write keys are embedded in shipped mobile binaries and are therefore public. Extraction and abuse are a matter of when. Mitigations to evaluate: per-tenant rate limits keyed on IP+device, origin/bundle-ID attestation, short-lived tokens exchanged at app start. Each trades operational complexity for abuse resistance.
+4. ~~**SDK key rotation**~~ — **Resolved, see [ADR-0007](../../decisions/0007-public-client-id-and-short-lived-ingest-tokens.md) and §3.9.** The embedded identifier is reclassified as a public client ID rather than a secret; a short-lived exchanged token becomes the actual credential. Rotation is an incident-response lever only, never an abuse control — on mobile it costs a release and a forced-upgrade cycle.
 5. **`props JSON` cardinality** — the >50-properties-per-event rejection is a guess. Needs a real limit derived from measured tenant behavior, plus monitoring on subcolumn count per tenant.
 6. **Query cache invalidation** — TTL-based caching means a customer's dashboard can be up to `ttl_ms` stale with no way to force freshness across all clients. Is a server-pushed invalidation signal needed, or is "pull to refresh" sufficient?
 

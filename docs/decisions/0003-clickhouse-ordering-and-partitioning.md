@@ -76,5 +76,5 @@ The `by_user` projection — `ORDER BY (tenant_id, user_id, ts)` — is specifie
 
 - Queries filtering by user without pinning an event name degrade to a partition scan. The bloom filter helps; it is not a substitute. The escape hatch is the `by_user` projection, at roughly 2× table storage.
 - Per-user and per-day deletion require `ALTER TABLE ... DELETE` mutations (slow, rewrites parts) rather than instant `DROP PARTITION`. GDPR deletion is per-user and would need a mutation under any partitioning scheme, so this is not a new cost.
-- `tenant_id` never comes from the client. It is resolved server-side from the write key; a client-supplied tenant field would be a cross-tenant write primitive.
+- `tenant_id` never comes from the request body. It is read server-side from the verified token's `tenant_id` claim (ADR-0007); a client-supplied tenant field would be a cross-tenant write primitive.
 - Changing the ordering key later means rewriting the table. Revisit only with measured evidence.
