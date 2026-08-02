@@ -1,0 +1,22 @@
+{
+  "eventId": "0191f4a2-1c3d-7000-8000-000000000001",
+  "name": "checkout_completed",
+  "tsClient": "1754092800000",
+  "seq": "42",
+  "deviceId": "device-abc",
+  "sessionId": "session-xyz",
+  "anonymousId": "anon-1",
+  "userId": "user-9",
+  "props": {
+    "amount": { "numberValue": 19.99 },
+    "currency": { "stringValue": "IDR" },
+    "first": { "boolValue": true }
+  },
+  "context": {
+    "sdkVersion": "0.1.0",
+    "appVersion": "2.3.4",
+    "os": "android",
+    "osVersion": "14",
+    "locale": "id-ID"
+  }
+}
