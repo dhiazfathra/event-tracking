@@ -1,9 +1,11 @@
 # ADR-0003: ClickHouse ordering key and partitioning for the events table
 
 ## Status
+
 Accepted
 
 ## Date
+
 2026-08-02
 
 ## Context
@@ -32,7 +34,7 @@ The `by_user` projection — `ORDER BY (tenant_id, user_id, ts)` — is specifie
 
 ## Rationale
 
-- **`tenant_id` first** — every query is tenant-scoped. As a key prefix, tenant isolation becomes a range scan over one tenant's data rather than a filter over everyone's. It also makes future sharding on `cityHash64(tenant_id)` clean: a tenant lives on one shard, so normal queries need no scatter-gather.
+- **`tenant_id` first** — every query is tenant-scoped. This is a pruning optimization, not the isolation mechanism: as a key prefix it lets ClickHouse skip granules outside one tenant's range instead of scanning the table, making a correctly-scoped query cheap. The isolation guarantee itself comes from the query compiler always injecting the `tenant_id` predicate server-side (ADR-0006) — the ordering key does nothing to stop a query that omits that predicate. It also sets up future sharding on `cityHash64(tenant_id)`, where a tenant's data living on one shard lets shard pruning skip the others, conditional on `optimize_skip_unused_shards` being enabled and the query actually filtering on the sharding key.
 - **`name` second** — dashboards pin one event name. Low cardinality keeps the prefix cheap.
 - **`ts` third** — the range-scan dimension.
 - **`event_id` last** — makes the sort key unique, which `ReplacingMergeTree` requires to collapse actual duplicates rather than distinct rows sharing a key.
@@ -41,26 +43,31 @@ The `by_user` projection — `ORDER BY (tenant_id, user_id, ts)` — is specifie
 ## Alternatives Considered
 
 ### `ORDER BY (tenant_id, ts, name, event_id)`
+
 - Pros: Uniformly good for any time-range query regardless of event name.
 - Cons: Loses the ability to scan a single event name's rows contiguously — the dominant dashboard query.
 - Rejected: Optimizes the less common shape.
 
 ### `ORDER BY (tenant_id, user_id, ts, event_id)`
+
 - Pros: Excellent for per-user debugging.
 - Cons: High-cardinality `user_id` early in the key fragments compression; makes name-filtered dashboard queries scan broadly.
 - Rejected: Wrong dominant workload. Available as a projection instead.
 
 ### Table-per-tenant
+
 - Pros: Perfect isolation, trivial per-tenant deletion via `DROP TABLE`.
 - Cons: Thousands of tables is a known ClickHouse anti-pattern — metadata pressure, unusable cross-tenant operations, painful schema migrations.
 - Rejected: Does not survive tenant growth.
 
 ### Daily partitions (`toYYYYMMDD`)
+
 - Pros: `DROP PARTITION` for surgical removal of a bad day.
 - Cons: ~400 partitions under a 13-month TTL, more parts and merge overhead, no query benefit.
 - Rejected: Cost without matching benefit at this retention.
 
 ### `MergeTree` instead of `ReplacingMergeTree`
+
 - Pros: Simpler, no version column, no merge-time collapsing.
 - Cons: Duplicates from at-least-once delivery accumulate in storage forever.
 - Rejected: `ReplacingMergeTree` reclaims that space in the background at negligible cost. See ADR-0004.

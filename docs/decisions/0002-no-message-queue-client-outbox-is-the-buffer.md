@@ -1,9 +1,11 @@
 # ADR-0002: No message queue — the client outbox is the durable buffer
 
 ## Status
+
 Accepted
 
 ## Date
+
 2026-08-02
 
 ## Context
@@ -27,23 +29,26 @@ Add a queue when one of these three triggers fires, not before:
 ## Alternatives Considered
 
 ### Kafka / Redpanda between ingest and ClickHouse
+
 - Pros: Standard, well understood, enables replay and fan-out, absorbs spikes.
 - Cons: A second stateful cluster; a consumer service to write, deploy, and monitor; partition, offset, lag, and rebalance operations; a whole new class of failure modes.
 - Rejected for now: It buys durability the system already has. Listed as a triggered addition above.
 
 ### Ingest-side write-ahead log to disk or S3, replayed on recovery
+
 - Pros: Cheaper than Kafka, survives ClickHouse downtime.
 - Cons: Custom durable-storage code — the most dangerous kind to hand-roll — plus a replay path that only executes during incidents and is therefore never exercised.
 - Rejected: Strictly worse than letting clients hold data, since they hold it anyway.
 
 ### In-process buffering in the ingest service with fast acknowledgement
+
 - Pros: Very low ingest latency.
 - Cons: Acknowledges events that are not yet durable. A pod restart loses events the client has already deleted, breaking the at-least-once guarantee.
 - Rejected: Incompatible with the delivery contract.
 
 ## Consequences
 
-- ClickHouse downtime is visible to clients as `503` and in error metrics. Data is not lost, but the outage is not invisible either.
+- ClickHouse downtime is visible to clients as `503` and in error metrics. The client holds the data and keeps retrying — it is not lost *because of the downtime itself*. Data can still be lost if the outage outlasts the client's retry budget (20 attempts, ~1.5h) or its 10k-row outbox cap, which is bounded, counted loss rather than an unconditional guarantee (see ADR-0005). The outage is visible either way, never silent.
 - No stream replay exists. A schema bug that corrupts data on write cannot be reprocessed from a log — it must be fixed forward in ClickHouse.
 - Any future server-to-server ingestion path (no durable client) immediately trips trigger 3 and requires this decision to be revisited.
 - The ingest service stays stateless and scales horizontally for free.

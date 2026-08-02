@@ -11,7 +11,7 @@ These four answers drove every decision below. If one changes, re-read this docu
 |---|---|---|
 | Tenancy | Third-party SaaS | Write keys, server-derived `tenant_id`, per-tenant quotas, untrusted clients |
 | Scale target | ~1k events/sec (~86M/day, ~2.6B/month) | No Kafka. ClickHouse async inserts are the buffer |
-| Delivery | At-least-once, dedup on read | Client retries freely; `uniqExact(event_id)` at query time |
+| Delivery | At-least-once until exhaustion, then bounded loss | Client retries freely; `uniqExact(event_id)` at query time. Retry exhaustion (`dead`) and outbox overflow are intentional, counted data loss — not "never lost" |
 | Client sync | Events + local query cache | Append-only writes (no conflicts) + a read-through cache (server authoritative) |
 | Query consumers | Customer-facing analytics API | Constrained JSON DSL compiled to SQL. Never raw SQL passthrough |
 
@@ -19,7 +19,7 @@ These four answers drove every decision below. If one changes, re-read this docu
 
 ## 1. High-Level Architecture
 
-```
+```text
 ┌──────────────────────────┐
 │  Flutter app + SDK       │
 │  ┌────────────────────┐  │
@@ -80,7 +80,7 @@ These four answers drove every decision below. If one changes, re-read this docu
 
 ## 2. Monorepo Structure
 
-```
+```text
 event-tracking/
 ├── buf.yaml
 ├── buf.gen.yaml
@@ -171,7 +171,7 @@ UUID v7 rather than v4: time-ordered UUIDs cluster in the ORDER BY tail and comp
 
 ### 3.2 Ingestion API
 
-```
+```http
 POST /v1/batch
 Authorization: Bearer wk_live_...
 Content-Encoding: gzip
@@ -201,10 +201,12 @@ Response is **always partial-success shaped**:
 | `200` | Batch processed (may contain rejects) | Delete accepted, mark rejected `dead` |
 | `400` | Batch envelope malformed | Drop batch, do not retry |
 | `401` | Bad write key | Stop syncing, surface to host app |
-| `413` | Batch too large | Halve batch size, retry |
+| `413` | Batch too large | Halve batch size, retry. If the batch is already a single event, mark that event `dead` and continue — see below |
 | `429` | Quota or rate limit | Retry after `Retry-After` |
 | `5xx` | Server or ClickHouse fault | Retry with backoff |
 | timeout | Unknown | Retry — safe, because `event_id` is stable |
+
+**Halving on `413` has a terminal case:** a single event whose own payload exceeds 1 MB decompressed cannot be shrunk by halving — it would loop on `413` forever. The client detects this (batch size already 1) and marks that one event `dead` rather than retrying, logging it to `sdk_dropped_events`. This is intentional, bounded data loss for a malformed oversized event, not a silent one — see the delivery-guarantee note in §5.
 
 ### 3.3 Enrichment and trust
 
@@ -223,6 +225,8 @@ Batching happens in three places, deliberately:
 3. **No in-process buffering in the ingest service.** A Go-side accumulator would create a window where the service has acked events it has not durably written — losing them on a pod restart while the client has already deleted them. `wait_for_async_insert=1` is the whole point: the `200` means durable.
 
 **Tradeoff:** `wait_for_async_insert=1` adds up to ~1s to p99 ingest latency. `=0` acks in microseconds but silently drops data if ClickHouse rejects the insert, which is incompatible with promising at-least-once. Latency is the correct thing to trade here — nobody is watching an ingestion request finish.
+
+**What `200` actually guarantees:** `wait_for_async_insert=1` confirms the data was flushed to the ClickHouse node(s) that received the insert — it does not wait for replication to other replicas or for any backup copy. At initial scale (§3.8) the cluster is a single node, so "flushed" and "durable" are the same thing. Once replication is introduced, this needs a stated `insert_quorum` (or equivalent) so `200` continues to mean what the client's outbox deletion assumes: the event is safe to forget. Until then, node-level flush is the durability boundary, and it is a single point of failure — acceptable at this stage because the client outbox holds the data until it gets a `200` in the first place, so a lost unreplicated write surfaces as a retry, not silent loss.
 
 ### 3.5 ClickHouse schema
 
@@ -264,7 +268,7 @@ SETTINGS index_granularity = 8192;
 
 **ORDER BY `(tenant_id, name, ts, event_id)`:**
 
-- `tenant_id` first — every single query is tenant-scoped. Putting it first makes tenant isolation a primary-key prefix scan rather than a filter, which is the difference between reading one tenant's data and reading everyone's.
+- `tenant_id` first — every single query is tenant-scoped. This is a **performance** choice, not the security boundary: putting `tenant_id` first lets the primary index prune to one tenant's granules instead of scanning the whole table, so an isolated query is cheap. The actual security guarantee is that the query compiler injects the `tenant_id` predicate server-side (§4, ADR-0006) — a query with no `WHERE tenant_id = ...` at all would still read every tenant's rows regardless of sort order, just slower. The ordering key makes correct isolation fast; it does not make incorrect queries safe.
 - `name` second — dashboard queries almost always pin one event name (`"checkout_completed" over time`). Low cardinality, so this stays a cheap prefix.
 - `ts` third — the actual range scan dimension.
 - `event_id` last — makes the sort key unique, which `ReplacingMergeTree` needs to collapse duplicates rather than the row it thinks is a duplicate.
@@ -305,7 +309,8 @@ CREATE TABLE events_daily
 )
 ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(event_date)
-ORDER BY (tenant_id, event_date, name);
+ORDER BY (tenant_id, event_date, name)
+TTL event_date + INTERVAL 13 MONTH DELETE;
 
 CREATE MATERIALIZED VIEW events_daily_mv TO events_daily AS
 SELECT tenant_id, event_date, name, count() AS events, uniqState(user_id) AS users
@@ -316,6 +321,8 @@ FROM events GROUP BY tenant_id, event_date, name;
 
 The alternative — rebuilding rollups nightly from the deduplicated raw table — is correct but adds a scheduled job and a consistency window. Deferred until rollup drift is measured to actually matter.
 
+**Retention and deletion are matched to the raw table, not independently correct.** `events_daily` carries the same 13-month TTL as `events` so a rollup row cannot outlive its source data. Deletion is the harder case: an `ALTER TABLE events ... DELETE` (per-user GDPR request, §7) removes rows from `events` but does **not** retroactively subtract their contribution from `events_daily` — the materialized view already summed them in. Until a subtraction or rebuild path exists, any per-user deletion must also trigger a rebuild of the affected `events_daily` partitions from the now-deleted-from raw table (`INSERT INTO events_daily SELECT ... FROM events WHERE event_date = ... GROUP BY ...` after clearing the partition), not just the raw-table mutation. This is real operational work and is called out explicitly in §7 as an open question to resolve before the first deletion request, precisely because rollup responses must not go on serving a deleted user's data after the platform has told them it's gone.
+
 ### 3.8 Scaling path
 
 The design is honest about what it is: a single-cluster design sized for the stated 1k eps, with named triggers for each next step.
@@ -325,8 +332,10 @@ The design is honest about what it is: a single-cluster design sized for the sta
 | Ingest CPU/network | p99 latency climbs, pods saturated | Scale ingest pods horizontally — they are stateless. Free. |
 | ClickHouse insert throughput | "too many parts", merge lag | Raise `async_insert_max_data_size`, then add a replica. |
 | Query contention with ingest | Dashboards slow during traffic peaks | Split reads to a dedicated replica. |
-| Single-node storage/CPU | Node saturated regardless of tuning | Shard on `cityHash64(tenant_id)`; `Distributed` table over shards. `tenant_id` leading the sort key means a tenant lives on one shard — no scatter-gather for normal queries. |
+| Single-node storage/CPU | Node saturated regardless of tuning | Shard on `cityHash64(tenant_id)`; `Distributed` table over shards. |
 | Need stream replay or a 2nd consumer | Schema bug requires reprocessing; someone wants a real-time stream | **Now** add Kafka/Redpanda between ingest and ClickHouse. |
+
+**Shard pruning is conditional, not automatic.** `tenant_id` leading the sort key does not by itself make a `Distributed` table skip shards. Skipping requires all three: data actually distributed by `cityHash64(tenant_id)`, `optimize_skip_unused_shards` enabled, and the query filtering on `tenant_id` (which it always does, per ADR-0006). Verify with `EXPLAIN` or a cluster test before relying on it — a misconfigured cluster where these don't line up silently falls back to scatter-gather, or worse, produces wrong results if the setting is on but the distribution isn't consistent with the sharding key.
 
 **Why Kafka is absent at the start:** at 1k eps it buys a buffer the system already has (the client outbox) at the price of a second cluster, a consumer service, partition/offset/lag operations, and a rebalance failure mode. The three things that genuinely justify it — replay after a bad deploy, multiple consumers of the raw stream, and accepting writes while ClickHouse is down — are all either absent or already solved by the client holding its own events. Listed as triggers rather than built now.
 
@@ -377,11 +386,11 @@ CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
 
 `Tracker.track(name, props)` builds the event, does one `INSERT`, and returns. Three non-negotiable properties:
 
-- **Never blocks the caller meaningfully.** One WAL insert with `synchronous=NORMAL` is sub-millisecond.
-- **Never throws into host app code.** A telemetry SDK that can crash the app it measures is a liability. All errors are swallowed and counted.
+- **Never blocks the caller meaningfully.** `track()` awaits the WAL insert (`synchronous=NORMAL`, sub-millisecond) — that await is the commit point and the durability boundary: the call returns once the row exists on disk, not before.
+- **Never throws into host app code.** A telemetry SDK that can crash the app it measures is a liability. A failed insert (disk full, mid-migration) is caught inside `track()`, counted in `counters.write_failures`, and swallowed — the event is genuinely lost in that case, since there is no durable fallback to fall back to, but the loss is visible via the counter, not silent.
 - **No in-memory buffer.** An accumulator flushed every ~200ms would save a few fsyncs and create a window where a crash loses the events that most need capturing — the ones right before the crash. WAL mode makes immediate writes cheap enough that the buffer earns nothing.
 
-**Bounded outbox:** capped at 10,000 events. On overflow the oldest `pending` rows are dropped and `counters.dropped_events` is incremented; that counter ships with the next batch as an `sdk_dropped_events` event. An unbounded outbox on a long-offline device fills the host app's storage and gets the app uninstalled. Losing the oldest telemetry is the correct failure — but it must be *visible*, hence the counter.
+**Bounded outbox:** capped at 10,000 rows total, across every state. On overflow the oldest `pending` rows are dropped first and `counters.dropped_events` is incremented. If all 10,000 rows are `inflight` (no `pending` row available to evict — a flush stuck or in progress), the new capture is dropped instead of exceeding the cap, also counted in `dropped_events`; that counter ships with the next successful batch as an `sdk_dropped_events` event. An unbounded outbox on a long-offline device fills the host app's storage and gets the app uninstalled. Losing the oldest telemetry is the correct failure — but it must be *visible*, hence the counter.
 
 ### 4.3 Sync engine
 
@@ -391,7 +400,7 @@ Connectivity events are a *hint*, never proof — captive portals report connect
 
 **Send algorithm:**
 
-```
+```text
 1. BEGIN IMMEDIATE
      SELECT * FROM outbox
       WHERE state='pending' AND next_attempt_at <= now
@@ -408,7 +417,7 @@ Connectivity events are a *hint*, never proof — captive portals report connect
 5. on 400/401: per the status contract above
 ```
 
-**`inflight` is persisted, not in-memory.** If the process dies mid-request, an in-memory marker loses the events entirely. On SDK init, any `inflight` row older than 5 minutes is reset to `pending`. This resend after a crash is safe precisely because `event_id` is stable and the server dedups on read — the at-least-once choice is what makes crash recovery a two-line fix instead of a distributed-systems problem.
+**`inflight` is persisted, not in-memory.** If the process dies mid-request, an in-memory marker loses the events entirely. Any `inflight` row older than 5 minutes is reset to `pending` — checked on SDK init *and* at the start of every flush cycle, not init alone, so a timed-out request or a dead flush worker doesn't leave rows stuck until the app happens to restart. This resend after a crash is safe precisely because `event_id` is stable and the server dedups on read — the at-least-once choice is what makes crash recovery a two-line fix instead of a distributed-systems problem.
 
 **Backoff:** exponential from 2s, doubling, capped at 5 minutes, with ±25% jitter. Jitter is not cosmetic: without it, every client that failed during an outage retries in lockstep the moment the service recovers and knocks it over again. After 20 attempts (~1.5h of retries) the event is marked `dead` and retained 7 days for diagnostics.
 
@@ -442,7 +451,7 @@ An opt-in `optimistic: true` mode is available, which surfaces the pending count
 
 | Property | Mechanism |
 |---|---|
-| Delivery guarantee | At-least-once. Client retries until `2xx` or `dead`. |
+| Delivery guarantee | At-least-once, bounded by retry exhaustion and outbox capacity. Client retries until `2xx` or `dead` (20 attempts, ~1.5h). Overflow past 10k rows and `dead` events are intentional, counted loss — this is not an unconditional "never lost" guarantee. |
 | Idempotency | Client-generated UUID v7 `event_id`, stable across retries. |
 | Dedup point | Query time, `uniqExact(event_id)`. Storage reclaimed by `ReplacingMergeTree` merges. |
 | Ordering | `(device_id, seq)` monotonic per install; for observability, not for correctness. |

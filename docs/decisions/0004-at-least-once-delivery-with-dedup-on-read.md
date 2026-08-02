@@ -1,9 +1,11 @@
 # ADR-0004: At-least-once delivery with deduplication on read
 
 ## Status
+
 Accepted
 
 ## Date
+
 2026-08-02
 
 ## Context
@@ -14,7 +16,9 @@ The platform must decide where duplicates are resolved: at write time (server-si
 
 ## Decision
 
-**At-least-once delivery with deduplication on read.**
+**At-least-once delivery with deduplication on read, bounded by retry exhaustion and outbox capacity.**
+
+"At-least-once" describes the retry behavior while the client is still trying: every send attempt is retried until acknowledged. It is not an unconditional never-lose-data guarantee — a client that exhausts its retry budget (`dead` after 20 attempts) or its bounded outbox (10k rows, oldest `pending` dropped on overflow, see ADR-0005) has made a deliberate, counted decision to stop trying. Delivery is at-least-once up to that boundary, then it is bounded loss, visible via `sdk_dropped_events`.
 
 - The client assigns a UUID v7 `event_id` at capture time. It is stable across every retry of that event.
 - The client retries freely on `429`, `5xx`, and timeouts.
@@ -27,21 +31,25 @@ An `approximate: true` flag in the query DSL switches to `uniq()` (HyperLogLog, 
 ## Alternatives Considered
 
 ### Duplicates tolerated, no deduplication at all
+
 - Pros: Cheapest possible read path.
 - Cons: Counts are wrong by an unbounded, traffic-dependent margin. Fine for trend shapes, unacceptable for anything a customer reports as a number.
 - Rejected: This is a customer-facing analytics product.
 
 ### Effectively-exactly-once via a server-side dedup window
+
 - Pros: Clean data at rest; `count(*)` is correct.
 - Cons: Requires a dedup store (Redis or a ClickHouse lookup) on the hot ingest path, adds latency and memory proportional to the window, and is still only correct *within* the window. Retries after a long offline period fall outside it.
 - Rejected: Real complexity and latency for a guarantee that remains approximate at the boundary.
 
 ### `SELECT ... FINAL`
+
 - Pros: Reads the deduplicated view directly.
 - Cons: Forces a merge at query time. The most common way to make a ClickHouse dashboard slow.
 - Rejected: `uniqExact(event_id)` achieves the same result without the merge.
 
 ### Server-generated event IDs
+
 - Pros: Server controls uniqueness.
 - Cons: A retried event gets a new ID and becomes a genuine duplicate. Destroys idempotency entirely.
 - Rejected: The client must own the ID for retries to be safe.

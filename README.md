@@ -25,7 +25,7 @@ Decisions are not deleted when they change. Supersede them with a new ADR that r
 
 ## Planned Layout
 
-```
+```text
 proto/tracking/v1/      contract source of truth (buf)
 gen/{go,dart}/          generated types, committed
 services/{ingest,query}/
@@ -40,4 +40,4 @@ Boundary rules, enforced in CI: `services/*` never import each other; the Flutte
 
 ## Note on `.gitignore`
 
-The current `.gitignore` ignores `go.work`. That is the right default for a single-module repository and the wrong one here — this monorepo uses `go.work` to wire `services/*`, `pkg/*`, and `gen/go` together, so it must be committed. Remove that entry when the Go workspace lands.
+The current `.gitignore` ignores `go.work`. That is the right default for a single-module repository and the wrong one for the planned monorepo — once the Go workspace lands, `go.work` will wire `services/*`, `pkg/*`, and `gen/go` together and must be committed. Remove the ignore entry in the same change that adds the workspace.

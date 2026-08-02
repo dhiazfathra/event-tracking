@@ -1,9 +1,11 @@
 # ADR-0006: Constrained query DSL instead of SQL passthrough
 
 ## Status
+
 Accepted
 
 ## Date
+
 2026-08-02
 
 ## Context
@@ -30,24 +32,27 @@ Expose a **constrained JSON query DSL**, compiled server-side by `pkg/querydsl` 
 
 Endpoints: `POST /v1/query/{timeseries,funnel,retention,breakdown}`.
 
-- `tenant_id` is injected by the compiler from the authenticated read key. It is never accepted from the request body.
+- `tenant_id` is injected by the compiler as a parameter from the authenticated read key — it is not a field the request DSL can contain, so there is nothing in the request body to override or omit. A `tenant_id` present in a request payload is rejected as an unknown field rather than silently ignored, so an attacker cannot rely on a codepath that reads the wrong source. The compiler adds an unconditional `tenant_id = :tenant_id` predicate to every compiled query; there is no branch that can produce SQL without it.
 - Every query executes under a per-tenant-tier ClickHouse settings profile: `max_execution_time`, `max_rows_to_read`, `max_memory_usage`, `max_result_rows`.
-- Responses carry `etag`, `computed_at`, and `source` (`"raw"` or `"rollup"`), feeding the client-side query cache.
-- Every `pkg/querydsl` golden test asserts that the emitted SQL contains a `tenant_id` predicate. A missing tenant predicate is a cross-tenant data leak and must be impossible to merge.
+- Responses carry `etag`, `computed_at`, `source` (`"raw"` or `"rollup"`), and `exact` (`true` for a raw-table `uniqExact` result, `false` for anything sourced from `events_daily` or computed with the `approximate` flag). `source: "rollup"` must never be read as authoritative by clients — `exact: false` says so explicitly rather than relying on callers to know that rollups inflate counts (see ADR-0004).
+- Every `pkg/querydsl` golden test asserts that the emitted SQL contains a `tenant_id` predicate, for every DSL shape (`timeseries`, `funnel`, `retention`, `breakdown`). A missing tenant predicate is a cross-tenant data leak and must be impossible to merge. In addition, an integration test runs the identical query for two different tenants against the same ClickHouse instance and asserts each response contains only its own tenant's rows — the golden tests catch a broken compiler, this catches a broken assumption about how the compiled SQL actually behaves against real data.
 
 ## Alternatives Considered
 
 ### Raw SQL with a read-only ClickHouse user and row policies
+
 - Pros: Maximum expressiveness; no backend work for new questions; ClickHouse row policies can enforce tenant isolation at the database layer.
 - Cons: Runaway queries and resource exhaustion remain (settings profiles help, but a customer can still write an accidental cross join); the physical schema becomes public API, so every future migration — including the deferred `by_user` projection or a partitioning change — is a breaking change; the abuse surface is unbounded.
 - Rejected: Schema coupling alone is disqualifying for a platform expected to evolve its storage layout.
 
 ### GraphQL
+
 - Pros: Familiar, good tooling, client-specified field selection.
 - Cons: Analytics queries are aggregations over time ranges, not object graphs. GraphQL's shape does not match, and query-cost bounding must be bolted on anyway.
 - Rejected: Wrong model for the domain.
 
 ### Fixed endpoints with no filtering or breakdown
+
 - Pros: Trivially safe and fast.
 - Cons: Too rigid to be a useful product. Every customer question becomes a feature request.
 - Rejected: Under-serves the actual use case.
