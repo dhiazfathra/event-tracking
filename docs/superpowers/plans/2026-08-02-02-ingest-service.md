@@ -837,7 +837,12 @@ CREATE TABLE client_ids (
     client_id   TEXT PRIMARY KEY,
     tenant_id   TEXT NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
     revoked_at  TIMESTAMPTZ,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- SHA-256 of a legacy `wk_live_` bearer key, for dual-accept lookups only.
+    -- Never the plaintext key: client_id itself is public (embedded in SDKs),
+    -- but a legacy key is a secret, so it is looked up by digest, the same as
+    -- read_keys.key_hash.
+    legacy_key_hash BYTEA UNIQUE
 );
 CREATE INDEX client_ids_tenant ON client_ids(tenant_id);
 
@@ -859,6 +864,12 @@ CREATE TABLE signing_keys (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     retired_at   TIMESTAMPTZ
 );
+-- At most one active, non-retired key at a time. This is what makes the
+-- bootstrap insert below conflict-safe instead of racy: two replicas that both
+-- try to create the first key hit this constraint, not a 50/50 chance of two
+-- active rows.
+CREATE UNIQUE INDEX signing_keys_one_active
+    ON signing_keys ((true)) WHERE active AND retired_at IS NULL;
 
 CREATE TABLE quotas (
     tenant_id        TEXT PRIMARY KEY REFERENCES tenants(tenant_id) ON DELETE CASCADE,
@@ -2244,7 +2255,7 @@ git commit -m "feat(ingest): build storage rows from verified claims, never the 
 **Interfaces:**
 - Consumes: `tenant.Claims`.
 - Produces:
-  - `type Limits struct { DailyEvents int64; RPS int; LegacyRPS int }`
+  - `limits.Quota` (from `pkg/limits`): `type Quota struct { DailyEvents int64; RPS int; LegacyRPS int }`
   - `type Checker struct{ ... }`
   - `func NewChecker(rdb *redis.Client) *Checker`
   - `func (c *Checker) Allow(ctx context.Context, cl tenant.Claims, lim Limits, n int, now time.Time) (Decision, error)`
@@ -2262,6 +2273,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dhiazfathra/event-tracking/pkg/limits"
 	"github.com/dhiazfathra/event-tracking/pkg/tenant"
 	"github.com/dhiazfathra/event-tracking/services/ingest/internal/quota"
 )
@@ -2270,7 +2282,7 @@ func TestDailyQuotaExhaustionReturns429WithRetryAfter(t *testing.T) {
 	ctx := context.Background()
 	c := quota.NewChecker(startRedis(t))
 	cl := tenant.Claims{TenantID: "t1", InstallID: "i-1"}
-	lim := quota.Limits{DailyEvents: 100, RPS: 1000}
+	lim := limits.Quota{DailyEvents: 100, RPS: 1000}
 	now := time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC)
 
 	d, err := c.Allow(ctx, cl, lim, 100, now)
@@ -2302,7 +2314,7 @@ func TestDailyQuotaExhaustionReturns429WithRetryAfter(t *testing.T) {
 func TestRateLimitKeysOnInstallFirst(t *testing.T) {
 	ctx := context.Background()
 	c := quota.NewChecker(startRedis(t))
-	lim := quota.Limits{DailyEvents: 1_000_000, RPS: 10}
+	lim := limits.Quota{DailyEvents: 1_000_000, RPS: 10}
 	now := time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC)
 
 	a := tenant.Claims{TenantID: "t1", InstallID: "install-A"}
@@ -2324,7 +2336,7 @@ func TestRateLimitWindowRollsOver(t *testing.T) {
 	ctx := context.Background()
 	c := quota.NewChecker(startRedis(t))
 	cl := tenant.Claims{TenantID: "t1", InstallID: "i-1"}
-	lim := quota.Limits{DailyEvents: 1_000_000, RPS: 5}
+	lim := limits.Quota{DailyEvents: 1_000_000, RPS: 5}
 	now := time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC)
 
 	_, _ = c.Allow(ctx, cl, lim, 5, now)
@@ -2344,7 +2356,7 @@ func TestConcurrentAllowNeverOverspendsOrUndercounts(t *testing.T) {
 	rdb := startRedis(t)
 	c := quota.NewChecker(rdb)
 	cl := tenant.Claims{TenantID: "t1", InstallID: "i-1"}
-	lim := quota.Limits{DailyEvents: 50, RPS: 1_000_000}
+	lim := limits.Quota{DailyEvents: 50, RPS: 1_000_000}
 	now := time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC)
 
 	const workers = 40
@@ -2416,18 +2428,9 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/dhiazfathra/event-tracking/pkg/limits"
 	"github.com/dhiazfathra/event-tracking/pkg/tenant"
 )
-
-type Limits struct {
-	DailyEvents int64
-	RPS         int
-
-	// LegacyRPS applies to pre-token wk_live_ credentials during the cutover.
-	// Deliberately below the tier-1 rate: deprecation pressure the SDK already
-	// absorbs, because it backs off on 429.
-	LegacyRPS int
-}
 
 type Decision struct {
 	Allowed    bool
@@ -2482,7 +2485,7 @@ return {1, ''}
 // Allow accounts n events and reports whether the batch may proceed.
 //
 // Consumption is all-or-nothing: a denied batch consumes no budget at all.
-func (c *Checker) Allow(ctx context.Context, cl tenant.Claims, lim Limits, n int, now time.Time) (Decision, error) {
+func (c *Checker) Allow(ctx context.Context, cl tenant.Claims, lim limits.Quota, n int, now time.Time) (Decision, error) {
 	rateKey := fmt.Sprintf("rl:{%s}:%s:%d", cl.TenantID, cl.InstallID, now.Unix())
 	dayKey := fmt.Sprintf("q:{%s}:%s", cl.TenantID, now.UTC().Format("2006-01-02"))
 
@@ -2544,7 +2547,7 @@ git commit -m "feat(ingest): redis quota and install-keyed rate limiting"
 **Interfaces:**
 - Consumes: `tenant.Verifier`, `validate.Event`, `enrich.Row`, `enrich.OffsetStore`, `quota.Checker`, `clickhouse.InsertEvents`, `limits.*`.
 - Produces:
-  - `type Deps struct { Verifier *tenant.Verifier; Legacy tenant.LegacyResolver; Offsets enrich.OffsetStore; Quota *quota.Checker; LimitsFor func(ctx context.Context, tenantID string, tier uint8) (quota.Limits, error); Insert func(ctx context.Context, rows []clickhouse.Row) error; Now func() time.Time; OnLegacyUse func(tenantID, sdkVersion string) }`
+  - `type Deps struct { Verifier *tenant.Verifier; Legacy tenant.LegacyResolver; Offsets enrich.OffsetStore; Quota *quota.Checker; LimitsFor func(ctx context.Context, tenantID string, tier uint8) (limits.Quota, error); Insert func(ctx context.Context, rows []clickhouse.Row) error; Now func() time.Time; OnLegacyUse func(tenantID, sdkVersion string) }`
   - `func NewBatch(d Deps) http.Handler`
 
 - [ ] **Step 1: Write the failing test**
@@ -2848,7 +2851,7 @@ type Deps struct {
 
 	Offsets   enrich.OffsetStore
 	Quota     *quota.Checker
-	LimitsFor func(ctx context.Context, tenantID string, tier uint8) (quota.Limits, error)
+	LimitsFor func(ctx context.Context, tenantID string, tier uint8) (limits.Quota, error)
 	Insert    func(ctx context.Context, rows []clickhouse.Row) error
 	Now       func() time.Time
 
@@ -3252,7 +3255,12 @@ type ChallengeStore interface {
 //
 // The nonce is bound to the client ID and platform that requested it, and
 // consumed atomically via GETDEL so two concurrent exchanges cannot both spend
-// the same one.
+// the same one. The key is scoped to client+platform only (the nonce is the
+// *value*, not part of the key), so a new Issue call overwrites any prior
+// outstanding challenge for that client+platform instead of accumulating a
+// fresh Redis key per call. That keeps outstanding challenges bounded to at
+// most one per client+platform regardless of call volume, with no separate
+// rate limiter needed for this endpoint.
 type RedisChallenges struct {
 	RDB *redis.Client
 	TTL time.Duration // 5 minutes is ample for an app-start round trip
@@ -3265,7 +3273,10 @@ func (c RedisChallenges) Issue(ctx context.Context, clientID, platform string) (
 	}
 	nonce := base64.RawURLEncoding.EncodeToString(raw)
 
-	if err := c.RDB.Set(ctx, c.key(clientID, platform, nonce), 1, c.TTL).Err(); err != nil {
+	// SET (not SETNX): a repeat call for the same client+platform replaces the
+	// previous nonce rather than adding a new key, so outstanding challenges
+	// never grow unbounded.
+	if err := c.RDB.Set(ctx, c.key(clientID, platform), nonce, c.TTL).Err(); err != nil {
 		return "", fmt.Errorf("store challenge: %w", err)
 	}
 	return nonce, nil
@@ -3276,12 +3287,14 @@ func (c RedisChallenges) Consume(ctx context.Context, clientID, platform, challe
 		return false
 	}
 	// GETDEL: present-and-removed in one round trip. A second attempt with the
-	// same nonce finds nothing.
-	return c.RDB.GetDel(ctx, c.key(clientID, platform, challenge)).Err() == nil
+	// same nonce finds nothing, and a stale nonce (superseded by a later Issue)
+	// never matches because it was overwritten, not appended.
+	got, err := c.RDB.GetDel(ctx, c.key(clientID, platform)).Result()
+	return err == nil && got == challenge
 }
 
-func (c RedisChallenges) key(clientID, platform, nonce string) string {
-	return fmt.Sprintf("att:{%s}:%s:%s", clientID, platform, nonce)
+func (c RedisChallenges) key(clientID, platform string) string {
+	return fmt.Sprintf("att:{%s}:%s", clientID, platform)
 }
 ```
 
@@ -3493,7 +3506,11 @@ the existing `install_id` when one is already present.
 
 Additionally, rate-limit the exchange endpoint itself per `(client_id, IP)` —
 `/v1/auth/token` is the one route reachable before an install bucket exists, so
-it needs its own ceiling.
+it needs its own ceiling. Apply the same `(client_id, IP)` limiter to
+`/v1/auth/challenge`: the replace-not-append `RedisChallenges.Issue` above
+already caps outstanding challenges to one per client+platform, but a caller
+can still call it as fast as the network allows, so the endpoint gets the same
+ceiling as `/v1/auth/token` rather than none at all.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -3740,6 +3757,25 @@ cd ../..
 cp migrations/postgres/*.sql pkg/controlplane/sql/
 ```
 
+Add `use ./pkg/controlplane` to `go.work` in this same commit — a committed
+`go.work` may only list `use` directives whose `go.mod` already exists, and
+`services/ingest/cmd/main.go` in this task imports
+`github.com/dhiazfathra/event-tracking/pkg/controlplane`, so the workspace
+entry has to land alongside the module, not in a later task:
+
+```go
+go 1.23
+
+use ./gen/go
+use ./pkg/limits
+use ./pkg/testsupport
+use ./tools
+use ./pkg/clickhouse
+use ./pkg/tenant
+use ./pkg/controlplane
+use ./services/ingest
+```
+
 Extend the `sync-migrations` Makefile target to cover this copy too, so it
 cannot go stale:
 
@@ -3869,12 +3905,16 @@ package controlplane
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/dhiazfathra/event-tracking/pkg/limits"
+	"github.com/dhiazfathra/event-tracking/pkg/tenant"
 )
 
 var ErrNotFound = errors.New("controlplane: not found")
@@ -3932,17 +3972,17 @@ func (s *Store) IssueInstall(ctx context.Context, tenantID, platform, subject, d
 	return installID, nil
 }
 
-func (s *Store) LimitsFor(ctx context.Context, tenantID string, tier uint8) (quota.Limits, error) {
-	var lim quota.Limits
+func (s *Store) LimitsFor(ctx context.Context, tenantID string, tier uint8) (limits.Quota, error) {
+	var lim limits.Quota
 	var rps0, rps1 int
 	err := s.pool.QueryRow(ctx,
 		`SELECT daily_events, rps_tier0, rps_tier1, rps_legacy FROM quotas WHERE tenant_id = $1`,
 		tenantID).Scan(&lim.DailyEvents, &rps0, &rps1, &lim.LegacyRPS)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return quota.Limits{}, ErrNotFound
+		return limits.Quota{}, ErrNotFound
 	}
 	if err != nil {
-		return quota.Limits{}, err
+		return limits.Quota{}, err
 	}
 
 	lim.RPS = rps0
@@ -3953,6 +3993,11 @@ func (s *Store) LimitsFor(ctx context.Context, tenantID string, tier uint8) (quo
 }
 
 // ResolveLegacy backs tenant.LegacyResolver.
+//
+// Looks up by the SHA-256 digest of the bearer key, never the plaintext key —
+// client_ids.client_id is a public identifier, not a place to compare secrets
+// against, and a database or backup reader must not be able to recover an
+// active legacy credential from this table.
 func (s *Store) ResolveLegacy(ctx context.Context, key string) (string, tenant.LegacyMode, error) {
 	sum := sha256.Sum256([]byte(key))
 
@@ -3961,22 +4006,23 @@ func (s *Store) ResolveLegacy(ctx context.Context, key string) (string, tenant.L
 	err := s.pool.QueryRow(ctx, `
 		SELECT c.tenant_id, t.legacy_key_mode
 		FROM client_ids c JOIN tenants t USING (tenant_id)
-		WHERE c.client_id = $1 AND c.revoked_at IS NULL`,
-		key).Scan(&tenantID, &mode)
+		WHERE c.legacy_key_hash = $1 AND c.revoked_at IS NULL`,
+		sum[:]).Scan(&tenantID, &mode)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", "", ErrNotFound
 	}
-	_ = sum
 	return tenantID, tenant.LegacyMode(mode), err
 }
 ```
 
 Import `crypto/sha256`, `github.com/dhiazfathra/event-tracking/pkg/tenant`, and
-`github.com/dhiazfathra/event-tracking/services/ingest/internal/quota` — except
-that last one would violate the `pkg/*` may-not-import-`services/*` rule, so
-**move `quota.Limits` to `pkg/limits`** as `limits.Quota` and have both the
-control plane and the quota checker depend on it. `make check-boundaries` fails
-otherwise, which is the rule doing its job.
+`github.com/dhiazfathra/event-tracking/pkg/limits` (for `LimitsFor`'s
+`limits.Quota` return type — never import
+`services/ingest/internal/quota` here, since that would violate the `pkg/*`
+may-not-import-`services/*` rule; `make check-boundaries` fails otherwise,
+which is the rule doing its job). The quota checker in
+`services/ingest/internal/quota` depends on the same `limits.Quota` type from
+`pkg/limits`, so both sides share one definition.
 
 - [ ] **Step 2: Write the signing-key source**
 
@@ -4054,6 +4100,13 @@ func (s *Store) PublicJWKS(ctx context.Context) (jwk.Set, error) {
 
 // EnsureSigningKey generates and activates a key when none exists. Called at
 // startup so a fresh environment is usable without a manual provisioning step.
+//
+// The `WHERE NOT EXISTS` guard alone is a check-then-insert race: two
+// replicas starting cold can both pass the check before either commits, and
+// both insert an active key. The `signing_keys_one_active` partial unique
+// index makes the second insert fail instead, and ON CONFLICT DO NOTHING
+// turns that failure into "someone else already bootstrapped it" rather than
+// an error the caller has to handle.
 func (s *Store) EnsureSigningKey(ctx context.Context, kid string) error {
 	pub, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
@@ -4062,9 +4115,48 @@ func (s *Store) EnsureSigningKey(ctx context.Context, kid string) error {
 	_, err = s.pool.Exec(ctx, `
 		INSERT INTO signing_keys (kid, public_key, private_key, active)
 		SELECT $1, $2, $3, true
-		WHERE NOT EXISTS (SELECT 1 FROM signing_keys WHERE active AND retired_at IS NULL)`,
+		WHERE NOT EXISTS (SELECT 1 FROM signing_keys WHERE active AND retired_at IS NULL)
+		ON CONFLICT ((true)) WHERE active AND retired_at IS NULL DO NOTHING`,
 		kid, []byte(pub), []byte(priv))
 	return err
+}
+```
+
+`services/ingest/pkg/controlplane/store_test.go` (testcontainers Postgres, same
+fixture as the rest of this package):
+
+```go
+func TestEnsureSigningKeyConcurrentCallsLeaveExactlyOneActiveKey(t *testing.T) {
+	ctx := context.Background()
+	pool := startPostgres(t)
+	store := controlplane.New(pool)
+
+	const workers = 20
+	var wg sync.WaitGroup
+	errs := make([]error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = store.EnsureSigningKey(ctx, fmt.Sprintf("kid-%d", i))
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("worker %d: %v", i, err)
+		}
+	}
+
+	var active int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM signing_keys WHERE active AND retired_at IS NULL`).
+		Scan(&active); err != nil {
+		t.Fatalf("count active: %v", err)
+	}
+	if active != 1 {
+		t.Fatalf("active signing keys = %d, want exactly 1", active)
+	}
 }
 ```
 
@@ -4216,6 +4308,7 @@ package handler_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -4333,9 +4426,22 @@ func postWithToken(t *testing.T, h http.Handler, body []byte, token string) *htt
 `enrich.NewPostgresOffsetStore(pool)` is the persistent `OffsetStore` backing
 the `session_offsets` table — `MemoryOffsetStore` must not be used outside
 tests, since it loses offsets on restart and disagrees across replicas, which
-breaks the stable-`ts` guarantee that read-time dedup depends on:
+breaks the stable-`ts` guarantee that read-time dedup depends on. Add it here,
+in the same package as the `OffsetStore` interface and `MemoryOffsetStore`
+defined in Task 7:
+
+`services/ingest/internal/enrich/postgres_offset_store.go`:
 
 ```go
+package enrich
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
 // PostgresOffsetStore persists first-contact offsets so a retry lands on the
 // same ts as the original — across restarts and across pods.
 type PostgresOffsetStore struct{ pool *pgxpool.Pool }
@@ -4365,6 +4471,43 @@ func (s *PostgresOffsetStore) GetOrSet(ctx context.Context, k SessionKey, candid
 
 The no-op `DO UPDATE` is deliberate: `ON CONFLICT DO NOTHING` returns no row, so
 there would be nothing to read back.
+
+`services/ingest/internal/enrich/postgres_offset_store_test.go` (testcontainers
+Postgres, same fixture as the rest of this package):
+
+```go
+package enrich_test
+
+func TestPostgresOffsetStoreConcurrentGetOrSetAgreeOnOneOffset(t *testing.T) {
+	ctx := context.Background()
+	pool := startPostgres(t) // brings up session_offsets via the Task 12 migration
+	store := enrich.NewPostgresOffsetStore(pool)
+	k := enrich.SessionKey{TenantID: "t1", DeviceID: "d1", SessionID: "s1"}
+
+	const workers = 20
+	results := make([]int64, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			offset, err := store.GetOrSet(ctx, k, int64(i))
+			if err != nil {
+				t.Errorf("GetOrSet: %v", err)
+				return
+			}
+			results[i] = offset
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 1; i < workers; i++ {
+		if results[i] != results[0] {
+			t.Fatalf("worker %d got offset %d, want %d — concurrent first-contact upsert disagreed", i, results[i], results[0])
+		}
+	}
+}
+```
 
 - [ ] **Step 5: Run it to verify it fails**
 
@@ -4632,7 +4775,6 @@ exists.
 
 `deploy/docker-compose.yml`:
 
-```yaml
 Plain `depends_on` only orders container *start*, not readiness — ingest would
 race ClickHouse's first boot and exit. Each dependency gets a healthcheck and a
 `service_healthy` condition. Schema migrations run inside `main` at startup
@@ -4690,6 +4832,12 @@ services:
       clickhouse: { condition: service_healthy }
       postgres:   { condition: service_healthy }
       redis:      { condition: service_healthy }
+    # The image is `distroless/static` — no shell, no curl, no wget, so a
+    # `test: [CMD, ...]` healthcheck has nothing to exec. `up --wait` would
+    # otherwise return as soon as the container starts, without ever checking
+    # /readyz. CI polls /readyz itself instead (see the "Compose stack comes
+    # up healthy" step below); a local `docker compose up` without --wait
+    # doesn't need one either, since ingest logs its own readiness.
 ```
 
 - [ ] **Step 9: Add the CI job**
@@ -4712,22 +4860,33 @@ Append to `.github/workflows/ci.yml`:
           cd ../controlplane && go test ./...
           cd ../../services/ingest && go test -tags e2e ./...
       # `build` alone would not catch a broken healthcheck or a service that
-      # exits on startup. `up --wait` blocks until every healthcheck passes.
+      # exits on startup. `up --wait` blocks until every *declared* healthcheck
+      # passes — but ingest's distroless image has no shell to run one, so
+      # `--wait` returns as soon as the container starts. Poll /readyz
+      # ourselves to actually verify the service came up, not just the
+      # container.
       - name: Compose stack comes up healthy
         run: |
           docker compose -f deploy/docker-compose.yml up -d --wait --build ingest
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/readyz; then break; fi
+            if [ "$i" -eq 30 ]; then echo "ingest never became ready"; exit 1; fi
+            sleep 1
+          done
           docker compose -f deploy/docker-compose.yml down -v
 ```
 
 - [ ] **Step 10: Run everything**
 
 Run:
+
 ```bash
 make sync-migrations
 go build ./... && go run ./tools/checkboundaries
 cd services/ingest && go test -race ./... && go test -tags e2e ./...
 docker compose -f ../../deploy/docker-compose.yml up -d --wait && docker compose -f ../../deploy/docker-compose.yml down
 ```
+
 Expected: build clean, all tests PASS, boundaries OK, and `--wait` returns
 without timing out — which is what proves the healthchecks are wired.
 

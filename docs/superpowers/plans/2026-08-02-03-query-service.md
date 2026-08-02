@@ -22,6 +22,17 @@ Copied verbatim from the spec. Every task's requirements implicitly include this
 - Raw `events` is the only source of truth.
 - Per-tenant ClickHouse settings profile bounds resource usage.
 - Responses carry `etag` and `computed_at`; `304` on `If-None-Match` refreshes the client TTL with no body.
+  **This is a deliberate deviation from RFC 9110 §15.4.5**, which reserves `304`
+  for `GET`/`HEAD` — `POST /v1/query/timeseries` is neither. The query DSL is a
+  JSON body too large and structured to fit safely in a cacheable `GET`
+  (query string encoding of nested filters/group-by is the alternative, and it
+  is worse: URL length limits and ad-hoc encoding for a security-sensitive
+  DSL). `304` here is an **application-level revalidation contract between this
+  service and its own SDK client**, not an HTTP shared-cache signal — the
+  handler also sets `Cache-Control: private, no-store` specifically so no
+  intermediary treats the response as cacheable or reuses the `304` in a way
+  RFC 9110 would license for a safe method. Do not rely on generic HTTP
+  clients, CDNs, or proxies to honor this `304`; only this SDK's client does.
 - Rollup retention matches raw retention: same 13-month TTL, so a rollup row cannot outlive its source.
 - Per-user deletion, rollup rebuild fencing, and the deletion epoch are **out of scope** (spec §3.7, §7.2). Consequently rollup reads are safe here only because no deletion path exists yet.
 
@@ -1108,35 +1119,76 @@ func TestETagIsStableAndSpecSensitive(t *testing.T) {
 	if querydsl.ETag("t1", req, changed) == a {
 		t.Error("etag unchanged when the content changed")
 	}
+
+	// The query spec itself is part of the validator, independent of content:
+	// two different requests over identical content must not collide, or a
+	// client that changes its interval/metric/group-by could get served a
+	// cached body from an unrelated query.
+	reqDayVsHour := &trackingv1.TimeseriesRequest{EventName: "e", FromMs: from.UnixMilli(), ToMs: from.Add(24 * time.Hour).UnixMilli(), Interval: trackingv1.Interval_INTERVAL_HOUR, Metric: trackingv1.Metric_METRIC_EVENTS}
+	if querydsl.ETag("t1", reqDayVsHour, content) == a {
+		t.Error("etag unchanged when only the query spec (Interval) changed")
+	}
+
+	reqDifferentMetric := &trackingv1.TimeseriesRequest{EventName: "e", FromMs: from.UnixMilli(), ToMs: from.Add(24 * time.Hour).UnixMilli(), Interval: trackingv1.Interval_INTERVAL_DAY, Metric: trackingv1.Metric_METRIC_USERS}
+	if querydsl.ETag("t1", reqDifferentMetric, content) == a {
+		t.Error("etag unchanged when only the query spec (Metric) changed")
+	}
 }
 
 // The whole point of the validator: an unchanged result must produce the same
 // ETag at two different computation times, or If-None-Match can never match and
-// the 304 path is unreachable.
+// the 304 path is unreachable. ComputedAt deliberately is not one of
+// ETagContent's parameters — it belongs on the handler's TimeseriesResponse,
+// not on the cached validator input — so this pins two distinct ComputedAt
+// values on the surrounding response, confirms they actually differ, and then
+// confirms the ETag computed from the same series/source/approximate is
+// identical regardless.
 func TestETagIgnoresComputationTime(t *testing.T) {
 	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	req := &trackingv1.TimeseriesRequest{EventName: "e", FromMs: from.UnixMilli(), ToMs: from.Add(24 * time.Hour).UnixMilli(), Interval: trackingv1.Interval_INTERVAL_DAY, Metric: trackingv1.Metric_METRIC_EVENTS}
 
 	series := []*trackingv1.Series{{Points: []*trackingv1.Point{{BucketMs: 1, Value: 42}}}}
+	firstComputedAt := from.UnixMilli()
+	secondComputedAt := from.Add(48 * time.Hour).UnixMilli()
+	if firstComputedAt == secondComputedAt {
+		t.Fatalf("test setup is broken: both ComputedAt values are %d", firstComputedAt)
+	}
+
 	first, _ := querydsl.ETagContent(series, "raw", false)
 	second, _ := querydsl.ETagContent(series, "raw", false)
 
 	if querydsl.ETag("t1", req, first) != querydsl.ETag("t1", req, second) {
-		t.Error("identical content produced different etags")
+		t.Error("identical content produced different etags across different ComputedAt values")
 	}
 }
 
 // rollup-vs-raw is a material difference in what the number means, so it must
-// change the validator.
+// change the validator. Source and approximation are asserted independently
+// here — changing both together (as a single combined case would) cannot
+// detect a bug where only one of the two fields is actually wired into
+// ETagContent.
 func TestETagDistinguishesSourceAndApproximation(t *testing.T) {
 	from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	req := &trackingv1.TimeseriesRequest{EventName: "e", FromMs: from.UnixMilli(), ToMs: from.Add(24 * time.Hour).UnixMilli(), Interval: trackingv1.Interval_INTERVAL_DAY, Metric: trackingv1.Metric_METRIC_EVENTS}
 
 	raw, _ := querydsl.ETagContent(nil, "raw", false)
 	rollup, _ := querydsl.ETagContent(nil, "rollup", true)
-
 	if querydsl.ETag("t1", req, raw) == querydsl.ETag("t1", req, rollup) {
-		t.Error("raw and rollup responses share an etag")
+		t.Error("raw/false and rollup/true responses share an etag")
+	}
+
+	// Source alone, approximation held constant.
+	rawApprox, _ := querydsl.ETagContent(nil, "raw", true)
+	rollupApprox, _ := querydsl.ETagContent(nil, "rollup", true)
+	if querydsl.ETag("t1", req, rawApprox) == querydsl.ETag("t1", req, rollupApprox) {
+		t.Error("etag unchanged when only source changed (approximate held at true)")
+	}
+
+	// Approximation alone, source held constant.
+	rawExact, _ := querydsl.ETagContent(nil, "raw", false)
+	rawInexact, _ := querydsl.ETagContent(nil, "raw", true)
+	if querydsl.ETag("t1", req, rawExact) == querydsl.ETag("t1", req, rawInexact) {
+		t.Error("etag unchanged when only approximate changed (source held at raw)")
 	}
 }
 ```
@@ -2144,6 +2196,7 @@ import (
 
 	trackingv1 "github.com/dhiazfathra/event-tracking/gen/go/tracking/v1"
 	"github.com/dhiazfathra/event-tracking/pkg/clickhouse"
+	"github.com/dhiazfathra/event-tracking/pkg/controlplane"
 	"github.com/dhiazfathra/event-tracking/pkg/querydsl"
 	"github.com/dhiazfathra/event-tracking/services/query/internal/auth"
 	"github.com/dhiazfathra/event-tracking/services/query/internal/execute"

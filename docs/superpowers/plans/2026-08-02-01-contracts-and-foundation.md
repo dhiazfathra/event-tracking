@@ -380,7 +380,7 @@ Each later task appends its own module in the same commit that creates the
 |---|---|
 | Task 4 | `./pkg/limits`, `./pkg/testsupport` |
 | Task 6 | `./tools` |
-| Plan 2 | `./pkg/clickhouse`, `./pkg/tenant`, `./services/ingest` |
+| Plan 2 | `./pkg/clickhouse`, `./pkg/tenant`, `./pkg/controlplane`, `./services/ingest` |
 | Plan 3 | `./pkg/querydsl`, `./services/query` |
 
 `./tools` matters more than it looks: the root `Makefile` runs
@@ -492,6 +492,20 @@ const (
 	// MaxRetryAttempts is when the client gives up and marks an event dead.
 	MaxRetryAttempts = 20
 )
+
+// Quota is the per-tenant budget shape shared by the control plane (which
+// reads it from Postgres) and the ingest quota checker (which enforces it in
+// Redis). It lives here, not in services/ingest, because pkg/controlplane may
+// not import services/* — this is the one place both sides can depend on.
+type Quota struct {
+	DailyEvents int64
+	RPS         int
+
+	// LegacyRPS applies to pre-token wk_live_ credentials during the cutover.
+	// Deliberately below the tier-1 rate: deprecation pressure the SDK already
+	// absorbs, because it backs off on 429.
+	LegacyRPS int
+}
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
