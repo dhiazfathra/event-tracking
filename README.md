@@ -42,3 +42,46 @@ Boundary rules, enforced in CI: `services/*` never import each other; the Flutte
 ## Note on `.gitignore`
 
 The current `.gitignore` ignores `go.work`. That is the right default for a single-module repository and the wrong one for the planned monorepo — once the Go workspace lands, `go.work` will wire `services/*`, `pkg/*`, and `gen/go` together and must be committed. Remove the ignore entry in the same change that adds the workspace.
+
+## Development
+
+### Prerequisites
+
+- Go 1.23+
+- [`buf`](https://buf.build/docs/installation) 1.47+
+- Dart 3.5+ / Flutter 3.24+ (only for `clients/flutter_sdk`)
+
+### Common commands
+
+```bash
+make gen               # regenerate gen/ from proto/ — commit the result
+make gen-check         # CI gate: fails if gen/ is stale
+make lint              # buf lint + golangci-lint
+make check-boundaries  # enforce the three module rules
+make test              # go test ./...
+```
+
+### Module rules
+
+1. `services/*` may not import each other — shared logic moves to `pkg/`.
+2. `clients/flutter_sdk` and `services/*` share exactly one thing: `gen/`.
+3. `pkg/*` may not import `services/*`.
+
+Rules 1 and 3 are enforced by `tools/checkboundaries` in CI. **Rule 2 is not** —
+it spans the Go/Dart line, which the Go import graph cannot see. It holds
+structurally instead: the SDK is a separate pub package with no path dependency
+on any Go module, so `flutter pub get` has nothing to resolve against
+`services/*`. The `flutter-sdk` CI job building the package in isolation is what
+would fail if that ever changed.
+
+### Why `gen/` is committed
+
+So neither a Go build nor `flutter pub get` requires the proto toolchain. The
+cost is merge noise, paid for by the `make gen-check` CI gate.
+
+### Wire format
+
+JSON, not protobuf binary. Proto defines the schema and drives codegen only.
+Note that proto-JSON encodes 64-bit integers (`ts_client`, `seq`, `received_at`)
+as **strings** — `testdata/golden/` pins this, and both the Go and Dart test
+suites read those same files.
