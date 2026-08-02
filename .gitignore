@@ -30,3 +30,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Agent worktrees — separate checkouts, must never be committed into the repo
+.claude/worktrees/

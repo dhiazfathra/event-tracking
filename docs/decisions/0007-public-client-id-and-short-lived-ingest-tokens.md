@@ -1,0 +1,164 @@
+# ADR-0007: Public client ID and short-lived ingest tokens
+
+## Status
+
+Accepted
+
+## Date
+
+2026-08-02
+
+## Context
+
+The Flutter SDK ships inside third-party customers' apps. The original design authenticated ingestion with a long-lived bearer write key (`wk_live_...`) embedded in the binary. Anything embedded in a distributed mobile binary is extractable — this is not a risk to mitigate, it is a certainty to design around.
+
+The naive framing ("how do we protect the embedded key?") has no good answer. Obfuscation, HMAC signing with an embedded secret, and certificate pinning all reduce to the same problem: a secret on a device the attacker owns is not a secret.
+
+The reframe that resolves this: **the embedded identifier is not a credential, it is a public client identifier.** It identifies a tenant; it authorizes nothing. Once that is true, its extraction is boring, and the security question moves to what the client can exchange it for.
+
+Rotation deserves special mention because it was the original framing. On mobile, rotating an embedded key requires a release and a forced-upgrade cycle — that is weeks. **Key rotation cannot function as an abuse control.** It is an incident-response lever only. Making the *token* the thing that expires removes rotation from the critical path entirely.
+
+Two constraints shape the specifics:
+
+- **Deployment context is Indonesian mobile.** Carriers (Telkomsel and peers) CGNAT aggressively — a single egress IP represents thousands of distinct real users. Any IP-primary rate limit is either set low enough to throttle half of Jakarta or high enough not to bind.
+- **Clinic data sits behind this platform**, bringing PDP Law obligations around *data spesifik* and an ISO 27001 posture that an assessor will read.
+
+## Decision
+
+Three mitigations, not as peers. **The token exchange is the architecture; the other two are the fence around it.**
+
+| Mitigation | Role | Sequencing |
+|---|---|---|
+| Short-lived exchanged tokens | The actual control | Build first — everything composes onto it |
+| Platform attestation | Gate on the exchange endpoint | Build second, with a documented degrade path |
+| Rate limits (install-keyed) | Cost cap, not security | Build, re-keyed off IP |
+
+### 1. Ship a client ID, not a secret
+
+The embedded identifier is public, useless on its own, and not rotation-critical. It identifies a tenant and authorizes nothing. This classification is deliberate and recorded (see Consequences).
+
+### 2. Attest at the exchange, not at ingest
+
+App Attest (iOS) and Play Integrity (Android) are the only mitigations here with cryptographic teeth: they prove a genuine unmodified binary on a genuine device. Bundle-ID and origin headers prove nothing — `curl` sets them. They are retained as telemetry, never as a control.
+
+Attestation runs once at the exchange endpoint, not on every ingest request. Ingest stays a hot path that only verifies a JWT.
+
+Planned-for failure modes:
+
+- Play Integrity standard requests are quota-limited.
+- App Attest fails on simulators.
+- Rooted, custom-ROM, and de-Googled devices fail **legitimately** — these are real users, not attackers.
+
+Therefore attestation failure does not block. It assigns a **trust tier**:
+
+- **Tier 0** — attestation passed. Normal rate limits.
+- **Tier 1** — attestation unavailable or failed. Tighter rate limits, nothing else.
+
+Blocking outright creates support load and data holes in exchange for very little.
+
+**Tier 1 is rate-limited, never sampled.** An earlier draft of this decision had Tier 1 traffic sampled at ingest. That is incompatible with the delivery contract: the client deletes an outbox row once the batch returns `200` (ADR-0002, ADR-0004), so silently discarding a sampled event server-side destroys it with no retry and no counter — exactly the silent loss the rest of this design refuses. Rate limiting has none of that problem: it returns `429`, which the SDK already handles by backing off and retrying, and which degrades to a counted `dead` event if it persists. Same cost-control outcome, no hole in the guarantee. If ingestion volume from Tier 1 ever needs harder suppression than rate limits provide, it must be done by rejecting events explicitly in the per-event `rejected` array (§3.2), never by dropping them behind a `200`.
+
+### 3. Exchange for a short-lived scoped token
+
+JWT signed so the ingest edge verifies with a public key and holds no shared secret.
+
+**Verification profile — pinned, not left to the implementation.** A permissive verifier is the standard way JWT auth fails, so every field below is a hard requirement and anything not matching is a `401`:
+
+| Field | Policy |
+|---|---|
+| `alg` | **`EdDSA` (Ed25519) only.** Single pinned algorithm, enforced against an allowlist before verification. `none` and all HMAC algorithms are rejected outright — never infer the algorithm from the token header alone |
+| `typ` | Must equal `at+jwt` |
+| `iss` | Must equal the platform's issuer URL, exact match |
+| `aud` | Must equal the ingest audience identifier, exact match — a token minted for any other audience is rejected even with a valid signature |
+| `exp` | Required. 30–60 minute lifetime. Rejected if expired, with ≤60s clock skew allowance |
+| `nbf` | Required. Rejected if not yet valid, same skew allowance |
+| `scope` | Must contain `write:events`. Ingest rejects any token without it |
+| `tenant_id` | Required, non-empty. The sole source of tenant identity (see §5) |
+| `install_id` | Required, non-empty. Server-issued (see §4) |
+| `trust_tier` | Required. `0` or `1` |
+| `kid` | Required. Must resolve to a current key in the JWKS whose `use` is `sig` and whose type is Ed25519-compatible (`kty: OKP`, `crv: Ed25519`). A key published for encryption, or of any other type, is rejected even if the signature would verify |
+
+Signature verification alone is not acceptance — a valid signature with `scope=write:events` does not bind a token to *this* endpoint without the `iss` and `aud` checks.
+
+**JWKS handling.** Public keys are fetched from a JWKS endpoint and cached with a bounded TTL. Key selection validates intent, not just identity: the resolved key must carry `use: "sig"` and `kty: "OKP"` with `crv: "Ed25519"`, and anything else is a `401`. Skipping that check is how a key published for a different purpose ends up trusted for ingest authorization. Rotation publishes the new key alongside the old with overlapping validity, so tokens signed before the rotation stay verifiable until they expire naturally. A `kid` miss triggers at most one out-of-cycle refetch, rate-limited, so an attacker cannot force unbounded JWKS traffic with forged `kid` values. Retired keys are removed only after the longest possible token lifetime has elapsed.
+
+### 4. Rate limits keyed on `install_id` first, tenant second, IP last
+
+**`install_id` is server-issued at the exchange, never client-supplied.** This matters more than it looks: `install_id` is the *primary* rate-limit bucket, so a client that could choose or rotate it could reset its own limit at will, reusing the public client ID to incur unbounded tenant and platform spend. The exchange derives it from the attestation payload where one is available (Tier 0), and otherwise mints and persists a server-side installation identity bound to the exchange (Tier 1). Either way the value reaching the JWT is one the server chose, and ingest treats it as authoritative precisely because it was never under client control.
+
+IP-primary limiting is actively harmful in this deployment (see CGNAT above). IP is retained only as a coarse anomaly signal.
+
+The per-tenant cap remains, but as **budget protection**: one abused tenant must not consume the whole ingestion spend.
+
+### 5. Write-only means write-only
+
+No reads, no enumeration, no listing, no cross-tenant access. The worst case of a fully abused pipeline is then cost plus data pollution — never exfiltration.
+
+**Stored tenant identity comes from the verified `tenant_id` claim, and only from there.** The event envelope has no tenant field (spec §3.1). If a request body ever carries one — a future SDK version, a hand-rolled client, an attacker — it is rejected as an unknown field, never merged and never preferred over the claim. Without this, a legitimately-issued token for tenant A could write rows labelled tenant B, which would defeat the isolation guarantee that ADR-0003 and ADR-0006 both depend on.
+
+This scoping is also the PDP Law argument: a stolen write token cannot reach *data spesifik*.
+
+### 6. Stamp every row
+
+The server stamps `ts_received`, the skew-corrected `ts`, `trust_tier`, and `install_id`. Cheap, and it is what permits retroactively quarantining a pollution window instead of dropping a table.
+
+**`event_id` is not server-assigned.** It remains the client-generated UUID v7 from ADR-0004, stable across every retry — that stability is the whole idempotency mechanism, and minting a server-side ID per attempt would turn each retry into a distinct row and break read-time deduplication outright. Uniqueness scope is `(tenant_id, event_id)`. A retry of an already-accepted event returns that same `event_id` in `accepted`, and the duplicate row collapses at merge time via `ReplacingMergeTree` exactly as ADR-0004 describes. Server stamping adds columns; it never replaces the client's identity for the row.
+
+### Sequencing
+
+- **Sprint 1** — token exchange (the current write key becomes the bootstrap client ID), server-issued `install_id`-keyed limits, write-scope audit. This alone converts a permanent public secret into a 60-minute one.
+- **Sprint 2–3** — attestation, trust tiers, degrade policy.
+- **Sprint 4** — legacy write-key ingest cutoff (below), remote-config rotation of the client ID, JWKS rotation runbook.
+
+### Legacy write-key cutover
+
+The existing `wk_live_...` value survives only as the bootstrap `client_id` presented to the exchange endpoint. **It must stop being accepted as an ingest bearer credential**, otherwise a leaked write key bypasses the 30–60 minute token lifetime entirely and the whole decision buys nothing.
+
+Staged, because the SDK ships in apps that cannot be force-upgraded:
+
+1. **Dual-accept** — ingest accepts both a legacy write key and a JWT. Every legacy-key request is logged with its tenant and SDK version to size the remaining exposure.
+2. **Deprecation window** — legacy-key requests still succeed but are rate-limited more tightly than Tier 1 and reported to the tenant as an upgrade signal. Length of this window is a per-tenant commitment, not an open-ended default.
+3. **Cutoff** — ingest returns `401` for legacy keys. Only the exchange endpoint still accepts them, and only as a `client_id`.
+
+**Rollback path:** the cutoff is a config flag per tenant, not a deploy, so an unexpectedly stranded customer can be moved back to dual-accept without a release while their upgrade is arranged.
+
+## Alternatives Considered
+
+### Obfuscating the key in the binary
+
+- Pros: Feels like defense.
+- Cons: Zero security value against anyone willing to run a disassembler; non-zero build complexity.
+- Rejected: Cost without benefit.
+
+### HMAC request signing with an embedded secret
+
+- Pros: Requests are unforgeable without the secret.
+- Cons: The secret is still in the binary — identical problem, more code, more ways to get the canonicalization wrong.
+- Rejected: Restates the problem as a solution.
+
+### Certificate pinning as an abuse control
+
+- Pros: Stops casual MITM.
+- Cons: Does not stop a determined extractor, and adds real outage risk when a certificate changes unexpectedly.
+- Rejected as an *abuse control*. If shipped for other reasons, it requires backup pins and a kill switch.
+
+### Rotating the embedded key on a schedule
+
+- Pros: Bounds the useful lifetime of a leaked key.
+- Cons: Requires a release and forced-upgrade cycle — weeks of latency. Cannot respond to an active incident.
+- Rejected as a control; retained as an incident-response lever only.
+
+### Blocking on attestation failure
+
+- Pros: Strongest possible gate.
+- Cons: Rooted, custom-ROM, and de-Googled devices fail legitimately; simulators fail; Play Integrity quota limits bite. Produces support load and silent data holes.
+- Rejected in favor of trust tiers.
+
+## Consequences
+
+- **The shipped identifier is classified as public, not a secret.** This classification is recorded deliberately, with the compensating controls named above. Without it, an ISO 27001 assessor reading "credential in a distributed binary" flags A.5.17 and A.8.5, and the argument happens in the audit rather than in the document.
+- **The rotation SLA and the attestation-failure degrade policy are decisions of record**, not things discovered under incident. An auditor will ask whether they were made deliberately.
+- Ingest gains a JWT verification step and loses the write-key lookup on the hot path. The control plane gains an exchange endpoint, a JWKS endpoint, and attestation integrations.
+- `trust_tier` becomes a column on `events` (see spec §3.5) and a dimension available for filtering polluted data.
+- Tier 1 traffic is rate-limited rather than sampled, so its data is complete unless a device is *sustainedly* over the limit — in which case the loss is ordinary retry exhaustion, already counted via `sdk_dropped_events` and already inside the bounded-loss contract (ADR-0004). No new silent-loss mode is introduced.
+- The 30–60 minute token lifetime bounds a stolen token's usefulness without requiring a client release. Rotation stops being load-bearing.
