@@ -39,10 +39,6 @@ testdata/golden/        fixtures read by both Go and Dart tests
 
 Boundary rules, enforced in CI: `services/*` never import each other; the Flutter SDK and the services share only `gen/`; `pkg/*` never imports `services/*`.
 
-## Note on `.gitignore`
-
-The current `.gitignore` ignores `go.work`. That is the right default for a single-module repository and the wrong one for the planned monorepo — once the Go workspace lands, `go.work` will wire `services/*`, `pkg/*`, and `gen/go` together and must be committed. Remove the ignore entry in the same change that adds the workspace.
-
 ## Development
 
 ### Prerequisites
