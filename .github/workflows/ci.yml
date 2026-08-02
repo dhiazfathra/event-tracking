@@ -28,13 +28,20 @@ jobs:
       # no-tag fallback also need different buf revision syntax: `tag=` only
       # accepts a real tag, so HEAD~1 must be given as `ref=`.
       - name: Breaking change check
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
           if [ -n "$tag" ]; then
-            buf breaking --against ".git#tag=$tag"
+            against=".git#tag=$tag"
+          elif [ -n "$PR_BASE_SHA" ]; then
+            # actions/checkout builds a synthetic merge commit for pull_request
+            # events, so HEAD~1 is unreliable; use the PR's actual base sha.
+            against=".git#ref=$PR_BASE_SHA"
           else
-            buf breaking --against '.git#ref=HEAD~1'
+            against='.git#ref=HEAD~1'
           fi
+          buf breaking --against "$against"
 
       - name: Generated code is up to date
         run: make gen-check
