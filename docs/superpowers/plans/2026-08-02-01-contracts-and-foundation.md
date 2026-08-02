@@ -320,8 +320,13 @@ gen:
 	buf generate
 
 # CI gate: generated code must match the protos exactly.
+#
+# The second line is not redundant: `git diff` says nothing about untracked
+# files, so a brand-new generated file would sit uncommitted while this check
+# passed.
 gen-check: gen
 	git diff --exit-code -- gen/
+	test -z "$$(git ls-files --others --exclude-standard -- gen/)"
 
 lint:
 	buf lint
@@ -841,8 +846,11 @@ mkdir -p tools/checkboundaries && cd tools && go mod init github.com/dhiazfathra
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -883,11 +891,19 @@ func listPackages() ([]pkgInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	// `go list -json` emits consecutive top-level objects, not a JSON array.
+	// Decoder.More() is only meaningful inside an array or object, so looping
+	// on it reads nothing here — and a checker that finds zero packages reports
+	// success while checking nothing.
 	var pkgs []pkgInfo
-	dec := json.NewDecoder(strings.NewReader(string(out)))
-	for dec.More() {
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for {
 		var p pkgInfo
-		if err := dec.Decode(&p); err != nil {
+		err := dec.Decode(&p)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
 			return nil, err
 		}
 		pkgs = append(pkgs, p)
@@ -952,8 +968,14 @@ use (
 - [ ] **Step 6: Run it against the real workspace**
 
 Run: `go run ./tools/checkboundaries`
-Expected: `module boundaries OK` (no services exist yet — this proves the tool runs
-clean rather than proving anything about the code).
+Expected: `module boundaries OK`.
+
+No services exist yet, so this only proves the tool runs. Confirm it actually
+decoded something before trusting that output — a checker that silently found
+zero packages also prints `OK`:
+
+Run: `go list -json ./... | grep -c ImportPath`
+Expected: a non-zero count matching the number of packages in the workspace.
 
 - [ ] **Step 7: Commit**
 

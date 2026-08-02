@@ -4711,8 +4711,12 @@ Append to `.github/workflows/ci.yml`:
           cd pkg/clickhouse && go test ./...
           cd ../controlplane && go test ./...
           cd ../../services/ingest && go test -tags e2e ./...
-      - name: Compose stack builds
-        run: docker compose -f deploy/docker-compose.yml build ingest
+      # `build` alone would not catch a broken healthcheck or a service that
+      # exits on startup. `up --wait` blocks until every healthcheck passes.
+      - name: Compose stack comes up healthy
+        run: |
+          docker compose -f deploy/docker-compose.yml up -d --wait --build ingest
+          docker compose -f deploy/docker-compose.yml down -v
 ```
 
 - [ ] **Step 10: Run everything**
