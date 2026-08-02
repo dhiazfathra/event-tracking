@@ -41,7 +41,15 @@ jobs:
           else
             against='.git#ref=HEAD~1'
           fi
-          buf breaking --against "$against"
+          # If the comparison ref predates buf.yaml/proto module, there is
+          # nothing to diff against and buf errors instead of no-op'ing.
+          ref=${against#.git#ref=}
+          ref=${ref#tag=}
+          if git cat-file -e "$ref:buf.yaml" 2>/dev/null; then
+            buf breaking --against "$against"
+          else
+            echo "Comparison ref has no buf.yaml yet; skipping breaking check."
+          fi
 
       - name: Generated code is up to date
         run: make gen-check
