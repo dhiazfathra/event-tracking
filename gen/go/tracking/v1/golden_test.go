@@ -1,6 +1,7 @@
 package trackingv1_test
 
 import (
+	"bytes"
 	"testing"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -52,24 +53,10 @@ func TestEventFullGoldenRoundTrip(t *testing.T) {
 func TestSixtyFourBitFieldsAreJSONStrings(t *testing.T) {
 	raw := testsupport.LoadGolden(t, "event_full.json")
 	for _, frag := range []string{`"tsClient": "1754092800000"`, `"seq": "42"`} {
-		if !contains(raw, frag) {
+		if !bytes.Contains(raw, []byte(frag)) {
 			t.Errorf("golden must encode 64-bit field as a JSON string; missing %s", frag)
 		}
 	}
-}
-
-func contains(hay []byte, needle string) bool {
-	return len(needle) > 0 && len(hay) >= len(needle) &&
-		string(hay) != "" && indexOf(string(hay), needle) >= 0
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }
 
 func TestBatchResponsePartialGolden(t *testing.T) {
