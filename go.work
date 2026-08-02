@@ -1,3 +1,7 @@
 go 1.23
 
-use ./gen/go
+use (
+	./gen/go
+	./pkg/limits
+	./pkg/testsupport
+)
