@@ -121,16 +121,16 @@ func (v *Verifier) Verify(ctx context.Context, bearer string, now time.Time) (Cl
 	}
 
 	var scope string
-	_ = tok.Get("scope", &scope)
+	_ = safeGet(tok, "scope", &scope)
 	if !hasScope(scope, ScopeWriteEvents) {
 		return Claims{}, fmt.Errorf("%w: %q", ErrBadScope, scope)
 	}
 
 	var c Claims
-	if err := tok.Get("tenant_id", &c.TenantID); err != nil || c.TenantID == "" {
+	if err := safeGet(tok, "tenant_id", &c.TenantID); err != nil || c.TenantID == "" {
 		return Claims{}, fmt.Errorf("%w: missing tenant_id", ErrMalformed)
 	}
-	if err := tok.Get("install_id", &c.InstallID); err != nil || c.InstallID == "" {
+	if err := safeGet(tok, "install_id", &c.InstallID); err != nil || c.InstallID == "" {
 		return Claims{}, fmt.Errorf("%w: missing install_id", ErrMalformed)
 	}
 	c.Scope = scope

@@ -313,6 +313,63 @@ func TestNewVerifierDefaultsHTTPClient(t *testing.T) {
 	}
 }
 
+// A wrong typ (e.g. an ID token or refresh token replayed here) must be
+// rejected even with a valid signature and otherwise-correct claims.
+func TestVerifyRejectsBadTyp(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	js := newJWKS(t, "kid-1", pub, "sig", "OKP")
+	v := tenant.NewVerifier(js.URL, testIssuer, testAudience, js.Client())
+
+	now := time.Now()
+	tok, err := jwt.NewBuilder().
+		Issuer(testIssuer).
+		Audience([]string{testAudience}).
+		IssuedAt(now).NotBefore(now).Expiration(now.Add(time.Hour)).
+		Claim("tenant_id", "t1").
+		Claim("install_id", "i-1").
+		Claim("scope", tenant.ScopeWriteEvents).
+		Claim("trust_tier", 0).
+		Build()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	hdrs := jws.NewHeaders()
+	_ = hdrs.Set("typ", "JWT") // wrong: not at+jwt
+	_ = hdrs.Set(jws.KeyIDKey, "kid-1")
+	key, _ := jwk.Import(priv)
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.EdDSA(), key, jws.WithProtectedHeaders(hdrs)))
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	if _, err := v.Verify(context.Background(), string(signed), time.Now()); !errors.Is(err, tenant.ErrBadType) {
+		t.Errorf("err = %v, want ErrBadType", err)
+	}
+}
+
+// A null tenant_id/install_id claim must fail closed with ErrMalformed, not
+// panic the ingest hot path. jwx's Token.Get panics assigning a JSON null
+// into a non-pointer destination; the verifier must recover from that.
+func TestVerifyRejectsNullOrMissingTenantAndInstallID(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	js := newJWKS(t, "kid-1", pub, "sig", "OKP")
+	v := tenant.NewVerifier(js.URL, testIssuer, testAudience, js.Client())
+
+	cases := map[string]func(*jwt.Builder){
+		"null tenant_id":  func(b *jwt.Builder) { b.Claim("tenant_id", nil) },
+		"null install_id": func(b *jwt.Builder) { b.Claim("install_id", nil) },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			tok := mint(t, priv, "kid-1", mutate)
+			_, err := v.Verify(context.Background(), tok, time.Now())
+			if !errors.Is(err, tenant.ErrMalformed) {
+				t.Errorf("err = %v, want ErrMalformed", err)
+			}
+		})
+	}
+}
+
 // An unreachable JWKS with no prior cache must fail closed immediately.
 func TestVerifyFailsClosedWithNoCacheAndUnreachableJWKS(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(nil)
