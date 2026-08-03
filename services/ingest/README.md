@@ -1,6 +1,7 @@
 # Ingest Service
 
-`POST /v1/auth/token` and `POST /v1/batch`.
+`POST /v1/auth/challenge`, `POST /v1/auth/token`, `GET /.well-known/jwks.json`,
+and `POST /v1/batch`.
 
 ## Status code contract
 
@@ -57,7 +58,7 @@ to bound install-row write amplification from `device_hint` churn — see
 ## Local development
 
 ```bash
-docker compose -f deploy/docker-compose.yml up -d
+docker compose -f deploy/docker-compose.yml up -d clickhouse postgres redis
 go run ./services/ingest/cmd
 ```
 

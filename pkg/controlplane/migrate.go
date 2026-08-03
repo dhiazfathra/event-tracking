@@ -44,6 +44,20 @@ func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 // ledger row — Postgres has transactional DDL, so a failed migration leaves no
 // partial state to reason about.
 func Migrate(ctx context.Context, pool *pgxpool.Pool, dir fs.FS) error {
+	// Serialize concurrent replicas racing to apply migrations against a cold
+	// database: without this, two processes can both see the first migration
+	// as unapplied and both try to create the same tables, and the loser's
+	// error triggers a startup crash-loop (main.go exits 1 on Migrate error).
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration lock connection: %w", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext('controlplane_migrate'))`); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	defer func() { _, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock(hashtext('controlplane_migrate'))`) }()
+
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			name       TEXT PRIMARY KEY,

@@ -172,15 +172,6 @@ func TestOffsetIsResolvedPerSessionNotPerBatch(t *testing.T) {
 	}
 }
 
-// An offset the store cannot resolve must not be silently replaced with zero:
-// a replay would then land at a different ts, move under the sort key, and stop
-// deduplicating. Fail the batch instead — the client still holds the events.
-// Quota is checked after validation, against the surviving event count. A
-// batch of nothing but malformed events must consume zero budget — otherwise
-// a client bug that spams garbage events burns real quota and 429s the
-// tenant's valid traffic. Bug: https://github.com/dhiazfathra/event-tracking
-// task-9 review — quota.Allow(n) was called with len(req.Events) before
-// filtering, so rejected events were charged.
 // A batch of entirely-malformed events still costs 1 unit of quota — the
 // floor charge that stops a client from sending unlimited all-garbage
 // batches at zero rate-limit cost (free parse+validate CPU, unbounded). It
@@ -230,6 +221,9 @@ func TestAllGarbageBatchStillConsumesQuota(t *testing.T) {
 	}
 }
 
+// An offset the store cannot resolve must not be silently replaced with zero:
+// a replay would then land at a different ts, move under the sort key, and stop
+// deduplicating. Fail the batch instead — the client still holds the events.
 func TestOffsetStoreFailureReturns503(t *testing.T) {
 	h := newTestHandlerFailingOffsets(t)
 	rec := post(t, h, batchJSON(t, []map[string]any{

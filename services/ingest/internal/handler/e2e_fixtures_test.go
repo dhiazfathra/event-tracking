@@ -72,7 +72,10 @@ func startFullStack(t *testing.T) *stack {
 	if err != nil {
 		t.Fatalf("active key: %v", err)
 	}
-	minter := tenant.NewMinter(key.KID, key.Private, issuer, audience, 45*time.Minute)
+	minter, err := tenant.NewMinter(key.KID, key.Private, issuer, audience, 45*time.Minute)
+	if err != nil {
+		t.Fatalf("new minter: %v", err)
+	}
 	verifier := tenant.NewVerifier(jwks.URL, issuer, audience, jwks.Client())
 
 	tokenDeps := handler.TokenDeps{
@@ -81,6 +84,7 @@ func startFullStack(t *testing.T) *stack {
 		Challenges:    attest.RedisChallenges{RDB: rdb, TTL: 5 * time.Minute},
 		ResolveTenant: store.ResolveTenant,
 		IssueInstall:  store.IssueInstall,
+		RateLimit:     quota.NewChecker(rdb),
 	}
 
 	return &stack{

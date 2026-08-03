@@ -117,17 +117,24 @@ func (c *Checker) Allow(ctx context.Context, cl tenant.Claims, lim limits.Quota,
 // all-or-nothing multi-counter admission decision, so the script's atomicity
 // guarantees do not apply here.
 func (c *Checker) AllowClient(ctx context.Context, key string, limit int, window time.Duration) (bool, error) {
-	n, err := c.rdb.Incr(ctx, key).Result()
+	n, err := clientRateScript.Run(ctx, c.rdb, []string{key}, int(window.Seconds())).Int64()
 	if err != nil {
 		return false, fmt.Errorf("client rate check: %w", err)
 	}
-	if n == 1 {
-		if err := c.rdb.Expire(ctx, key, window).Err(); err != nil {
-			return false, fmt.Errorf("client rate check: %w", err)
-		}
-	}
 	return n <= int64(limit), nil
 }
+
+// clientRateScript increments and arms the TTL in one round trip, so a
+// counter can never survive without an expiry (a lone Incr+Expire pair can
+// leave the key with no TTL if the process dies or Expire fails between the
+// two, locking the client out permanently).
+var clientRateScript = redis.NewScript(`
+local n = redis.call('INCR', KEYS[1])
+if n == 1 or redis.call('TTL', KEYS[1]) < 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return n
+`)
 
 // untilNextUTCDay is the honest Retry-After for an exhausted daily budget:
 // nothing the client does before midnight UTC will succeed.

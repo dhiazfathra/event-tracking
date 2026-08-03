@@ -47,7 +47,7 @@ Boundary rules, enforced in CI: `services/*` never import each other; the Flutte
 
 ### Prerequisites
 
-- Go 1.23+
+- Go 1.26+
 - [`buf`](https://buf.build/docs/installation) 1.47+
 - Dart 3.5+ / Flutter 3.24+ (only for `clients/flutter_sdk`)
 
@@ -81,10 +81,10 @@ cost is merge noise, paid for by the `make gen-check` CI gate.
 
 ### Running the ingest service
 
-`services/ingest` is a runnable binary: `POST /v1/auth/token`, `POST /v1/batch`,
-and `GET /.well-known/jwks.json`, backed by ClickHouse (events), Postgres
-(tenants, installs, quotas, signing keys), and Redis (rate limiting, attestation
-challenges).
+`services/ingest` is a runnable binary: `POST /v1/auth/challenge`,
+`POST /v1/auth/token`, `POST /v1/batch`, and `GET /.well-known/jwks.json`,
+backed by ClickHouse (events), Postgres (tenants, installs, quotas, signing
+keys), and Redis (rate limiting, attestation challenges).
 
 ```bash
 docker compose -f deploy/docker-compose.yml up --build

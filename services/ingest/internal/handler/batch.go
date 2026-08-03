@@ -39,6 +39,10 @@ type Deps struct {
 	Insert    func(ctx context.Context, rows []clickhouse.Row) error
 	Now       func() time.Time
 
+	// OnClockSkew counts events whose corrected timestamp was clamped. Without
+	// it a device with a broken clock is invisible.
+	OnClockSkew func(tenantID, deviceID string)
+
 	// OnLegacyUse counts legacy credential usage per tenant and SDK version.
 	// That count is what tells you when a cutoff is safe.
 	OnLegacyUse func(tenantID, sdkVersion string)
@@ -170,7 +174,10 @@ func NewBatch(d Deps) http.Handler {
 				offsets[key] = offset
 			}
 
-			row, _ := enrich.Row(e, claims, offset, receivedAt)
+			row, clamped := enrich.Row(e, claims, offset, receivedAt)
+			if clamped && d.OnClockSkew != nil {
+				d.OnClockSkew(claims.TenantID, e.GetDeviceId())
+			}
 			rows = append(rows, row)
 			accepted = append(accepted, e.GetEventId())
 		}

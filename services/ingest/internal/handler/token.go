@@ -160,6 +160,20 @@ func NewChallenge(d TokenDeps) http.Handler {
 			return
 		}
 
+		if d.RateLimit != nil {
+			key := "rl:challenge:" + req.GetClientId()
+			ok, err := d.RateLimit.AllowClient(r.Context(), key, tokenRatePerMinute, tokenRateWindow)
+			if err != nil {
+				httpError(w, http.StatusServiceUnavailable, "rate limit unavailable")
+				return
+			}
+			if !ok {
+				w.Header().Set("Retry-After", "60")
+				httpError(w, http.StatusTooManyRequests, "rate_limit")
+				return
+			}
+		}
+
 		nonce, err := d.Challenges.Issue(r.Context(), req.GetClientId(), req.GetPlatform())
 		if err != nil {
 			httpError(w, http.StatusServiceUnavailable, "challenge unavailable")

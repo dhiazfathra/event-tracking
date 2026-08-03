@@ -70,7 +70,10 @@ func newTokenHandler(t *testing.T, attestor attest.Attestor) (http.Handler, atte
 		t.Fatalf("gen key: %v", err)
 	}
 	_ = pub
-	minter := tenant.NewMinter(testKID, priv, testIssuer, testAudience, 30*time.Minute)
+	minter, err := tenant.NewMinter(testKID, priv, testIssuer, testAudience, 30*time.Minute)
+	if err != nil {
+		t.Fatalf("new minter: %v", err)
+	}
 
 	rdb := startRedis(t)
 	challenges := attest.RedisChallenges{RDB: rdb, TTL: 5 * time.Minute}
@@ -237,13 +240,14 @@ func TestClientSuppliedInstallIDIsIgnored(t *testing.T) {
 // unbounded number of installs rows per tenant. RateLimit caps exchanges per
 // client_id regardless of what's inside the body.
 func TestTokenExchangeIsRateLimitedPerClient(t *testing.T) {
-	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(nil)
+	_, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		t.Fatalf("gen key: %v", err)
 	}
-	_ = pub
-	minter := tenant.NewMinter(testKID, priv, testIssuer, testAudience, 30*time.Minute)
+	minter, err := tenant.NewMinter(testKID, priv, testIssuer, testAudience, 30*time.Minute)
+	if err != nil {
+		t.Fatalf("new minter: %v", err)
+	}
 	rdb := startRedis(t)
 	installs := &memInstalls{}
 

@@ -88,11 +88,25 @@ func (s *Store) EnsureSigningKey(ctx context.Context, kid string) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO signing_keys (kid, public_key, private_key, active)
 		SELECT $1, $2, $3, true
 		WHERE NOT EXISTS (SELECT 1 FROM signing_keys WHERE active AND retired_at IS NULL)
 		ON CONFLICT DO NOTHING`,
 		kid, []byte(pub), []byte(priv))
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	// No row inserted: either another active key already exists (the
+	// intended, benign race we're guarding against), or this same kid was
+	// already used by a retired row, which the WHERE NOT EXISTS clause did
+	// not anticipate — that case leaves signing_keys with no active row at
+	// all. Distinguish them instead of silently treating both as success.
+	if _, err := s.ActiveSigningKey(ctx); err != nil {
+		return fmt.Errorf("ensure signing key %q: insert conflicted and no active key exists: %w", kid, err)
+	}
+	return nil
 }

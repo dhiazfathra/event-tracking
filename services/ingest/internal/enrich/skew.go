@@ -54,7 +54,16 @@ func Correct(tsClientMS, offsetMS int64, receivedAt time.Time) (time.Time, bool)
 // CandidateOffset is the first-contact estimate: how far behind the server the
 // device's clock appeared to be at send time.
 func CandidateOffset(sentAtMS int64, receivedAt time.Time) int64 {
-	return receivedAt.UnixMilli() - sentAtMS
+	if sentAtMS <= 0 {
+		// Absent or nonsensical sent_at. A zero offset is recoverable; a
+		// 55-year offset is pinned for the life of the session.
+		return 0
+	}
+	offset := receivedAt.UnixMilli() - sentAtMS
+	if offset > MaxPastSkew.Milliseconds() || offset < -MaxFutureSkew.Milliseconds() {
+		return 0
+	}
+	return offset
 }
 
 // MemoryOffsetStore is the in-process implementation. Production wires the

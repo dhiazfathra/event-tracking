@@ -67,7 +67,10 @@ func NewVerifier(jwksURL, issuer, audience string, client *http.Client) *Verifie
 // hot path: this does signature verification and claim checks only — no
 // database lookup, no attestation. Attestation happened at the exchange.
 func (v *Verifier) Verify(ctx context.Context, bearer string, now time.Time) (Claims, error) {
-	raw := []byte(strings.TrimPrefix(bearer, "Bearer "))
+	raw := []byte(bearer)
+	if scheme, rest, ok := strings.Cut(bearer, " "); ok && strings.EqualFold(scheme, "Bearer") {
+		raw = []byte(strings.TrimSpace(rest))
+	}
 
 	msg, err := jws.Parse(raw)
 	if err != nil || len(msg.Signatures()) != 1 {
@@ -172,7 +175,16 @@ func (v *Verifier) key(ctx context.Context, kid string, now time.Time) (jwk.Key,
 
 	stale := v.set == nil || now.Sub(v.fetchedAt) > jwksTTL
 	if stale {
-		if err := v.refetchLocked(ctx, now); err != nil {
+		// Rate-limit refetch attempts the same as the kid-miss path below.
+		// Without this, every request during a JWKS outage queues behind a
+		// fetch that will time out, serializing the hot path.
+		var err error
+		if v.set == nil || now.Sub(v.lastRefetch) >= jwksMinRefetch {
+			err = v.refetchLocked(ctx, now)
+		} else {
+			err = errors.New("refresh suppressed by rate limit")
+		}
+		if err != nil {
 			// Serving from a cached set after a failed refresh is deliberate —
 			// a JWKS blip must not take ingestion down — but it is bounded.
 			// Past the grace period the set is discarded: continuing to trust

@@ -62,7 +62,7 @@ func TestPostgresOffsetStoreConcurrentGetOrSetAgreeOnOneOffset(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			offset, err := store.GetOrSet(ctx, k, int64(i))
+			offset, err := store.GetOrSet(ctx, k, int64(i)+1)
 			if err != nil {
 				t.Errorf("GetOrSet: %v", err)
 				return
@@ -72,6 +72,9 @@ func TestPostgresOffsetStoreConcurrentGetOrSetAgreeOnOneOffset(t *testing.T) {
 	}
 	wg.Wait()
 
+	if results[0] == 0 {
+		t.Fatal("agreed offset is 0; no worker recorded a stored offset")
+	}
 	for i := 1; i < workers; i++ {
 		if results[i] != results[0] {
 			t.Fatalf("worker %d got offset %d, want %d — concurrent first-contact upsert disagreed", i, results[i], results[0])

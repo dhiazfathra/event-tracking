@@ -294,8 +294,9 @@ func newTestHandlerWithLegacy(t *testing.T, mode tenant.LegacyMode) (http.Handle
 		},
 	})
 
-	// No auto-injected token: legacy tests supply their own Authorization
-	// header via postWithAuth.
+	// authWrapper injects the JWT only when Authorization is empty, so legacy
+	// tests that supply a wk_live_ key via postWithAuth still take the legacy
+	// path. A legacy test that omits the header would silently use the JWT.
 	return authWrapper(h, token), s
 }
 

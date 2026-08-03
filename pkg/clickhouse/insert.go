@@ -55,6 +55,9 @@ func InsertEvents(ctx context.Context, conn driver.Conn, rows []Row) error {
 	if err != nil {
 		return fmt.Errorf("prepare batch: %w", err)
 	}
+	// Abort() releases the reserved connection back to the pool; it is a
+	// safe no-op after Send() already did so (returns ErrBatchAlreadySent).
+	defer batch.Abort()
 
 	for _, r := range rows {
 		if err := batch.Append(

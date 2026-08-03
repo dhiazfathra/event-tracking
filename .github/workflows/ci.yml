@@ -22,7 +22,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
         with:
-          go-version: '1.23'
+          go-version: '1.26'
       - uses: bufbuild/buf-setup-action@9672cee01808979ea1249f81d6d321217b9a10f6 # v1.47.2
         with:
           version: 1.47.2
@@ -95,7 +95,13 @@ jobs:
           docker compose -f deploy/docker-compose.yml up -d --wait --build ingest
           for i in $(seq 1 30); do
             if curl -sf http://localhost:8080/readyz; then break; fi
-            if [ "$i" -eq 30 ]; then echo "ingest never became ready"; exit 1; fi
+            if [ "$i" -eq 30 ]; then
+              echo "ingest never became ready"
+              docker compose -f deploy/docker-compose.yml logs --no-color
+              exit 1
+            fi
             sleep 1
           done
-          docker compose -f deploy/docker-compose.yml down -v
+      - name: Tear down compose stack
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v

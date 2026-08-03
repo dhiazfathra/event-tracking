@@ -48,7 +48,13 @@ func (v *Verifier) VerifyOrLegacy(ctx context.Context, bearer string, now time.T
 	if err != nil {
 		return Claims{}, true, fmt.Errorf("resolve legacy key: %w", err)
 	}
-	if mode == ModeCutoff {
+	switch mode {
+	case ModeDualAccept, ModeDeprecating:
+		// allowed
+	case ModeCutoff:
+		return Claims{}, true, ErrLegacyCutoff
+	default:
+		// Unknown/unset mode must fail closed, not fail open.
 		return Claims{}, true, ErrLegacyCutoff
 	}
 

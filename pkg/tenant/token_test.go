@@ -18,7 +18,10 @@ func TestMintProducesRequiredClaims(t *testing.T) {
 	}
 	_ = pub
 
-	m := tenant.NewMinter("kid-1", priv, "https://issuer.example", "https://ingest.example", 45*time.Minute)
+	m, err := tenant.NewMinter("kid-1", priv, "https://issuer.example", "https://ingest.example", 45*time.Minute)
+	if err != nil {
+		t.Fatalf("new minter: %v", err)
+	}
 	now := time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC)
 
 	raw, expiresIn, err := m.Mint(tenant.Claims{
@@ -59,7 +62,10 @@ func TestMintProducesRequiredClaims(t *testing.T) {
 // side. If the minter stops setting them, every token stops being accepted.
 func TestMintSetsHeaderTypAndAlg(t *testing.T) {
 	_, priv, _ := ed25519.GenerateKey(nil)
-	m := tenant.NewMinter("kid-1", priv, "iss", "aud", time.Hour)
+	m, err := tenant.NewMinter("kid-1", priv, "iss", "aud", time.Hour)
+	if err != nil {
+		t.Fatalf("new minter: %v", err)
+	}
 
 	raw, _, err := m.Mint(tenant.Claims{TenantID: "t1", InstallID: "i-1", Scope: "write:events"}, time.Now())
 	if err != nil {

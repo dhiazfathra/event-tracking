@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -81,9 +82,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	minter := tenant.NewMinter(key.KID, key.Private, issuer, audience, 45*time.Minute)
+	// Signing-key rotation requires a rolling restart: the minter above holds
+	// the active key for the process lifetime, while the JWKS handler reads
+	// the store per request. That's fine — rotation is rare and a restart is
+	// the deploy-time story already relied on for config changes.
+	minter, err := tenant.NewMinter(key.KID, key.Private, issuer, audience, 45*time.Minute)
+	if err != nil {
+		log.Error("minter", "err", err)
+		os.Exit(1)
+	}
+
+	listenAddr := env("LISTEN_ADDR", ":8080")
+	_, listenPort, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		log.Error("listen addr", "err", err)
+		os.Exit(1)
+	}
 	verifier := tenant.NewVerifier(
-		env("JWKS_URL", "http://127.0.0.1"+env("LISTEN_ADDR", ":8080")+"/.well-known/jwks.json"),
+		env("JWKS_URL", "http://127.0.0.1:"+listenPort+"/.well-known/jwks.json"),
 		issuer, audience, nil)
 
 	checker := quota.NewChecker(rdb)
@@ -139,7 +155,7 @@ func main() {
 	})
 
 	srv := &http.Server{
-		Addr:              env("LISTEN_ADDR", ":8080"),
+		Addr:              listenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		// ReadHeaderTimeout does not bound the body. Without ReadTimeout a
@@ -150,8 +166,11 @@ func main() {
 		// connection, which is the documented upload behaviour.
 		ReadTimeout: 60 * time.Second,
 		IdleTimeout: 120 * time.Second,
-		// Generous: wait_for_async_insert=1 can add ~1s.
-		WriteTimeout: 30 * time.Second,
+		// Go arms the write deadline once headers are read, so this must
+		// cover ReadTimeout plus handler time, not just the response write.
+		// 60s upload + ~30s handler budget (wait_for_async_insert=1 can add
+		// ~1s, quota and offset round-trips the rest).
+		WriteTimeout: 90 * time.Second,
 	}
 
 	go func() {

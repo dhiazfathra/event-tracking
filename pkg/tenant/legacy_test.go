@@ -60,6 +60,30 @@ func TestLegacyKeyRejectedAtCutoff(t *testing.T) {
 	}
 }
 
+func TestLegacyKeyRejectedForUnknownMode(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(nil)
+	js := newJWKS(t, "kid-1", pub, "sig", "OKP")
+	v := tenant.NewVerifier(js.URL, testIssuer, testAudience, js.Client())
+
+	_, _, err := v.VerifyOrLegacy(context.Background(), "Bearer wk_live_abc123", time.Now(),
+		stubResolver{tenantID: "t1"}) // zero-value mode
+	if err == nil {
+		t.Error("unknown legacy mode accepted; the mode check must fail closed")
+	}
+}
+
+func TestLegacyResolverErrorRejects(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(nil)
+	js := newJWKS(t, "kid-1", pub, "sig", "OKP")
+	v := tenant.NewVerifier(js.URL, testIssuer, testAudience, js.Client())
+
+	_, _, err := v.VerifyOrLegacy(context.Background(), "Bearer wk_live_abc123", time.Now(),
+		stubResolver{err: errors.New("db down")})
+	if err == nil {
+		t.Error("resolver error accepted")
+	}
+}
+
 func TestJWTPathUnaffectedByLegacyResolver(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(nil)
 	js := newJWKS(t, "kid-1", pub, "sig", "OKP")

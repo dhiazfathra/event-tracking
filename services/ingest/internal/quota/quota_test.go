@@ -54,14 +54,22 @@ func TestRateLimitKeysOnInstallFirst(t *testing.T) {
 	a := tenant.Claims{TenantID: "t1", InstallID: "install-A"}
 	b := tenant.Claims{TenantID: "t1", InstallID: "install-B"}
 
-	if d, _ := c.Allow(ctx, a, lim, 10, now); !d.Allowed {
+	allow := func(cl tenant.Claims, n int) quota.Decision {
+		d, err := c.Allow(ctx, cl, lim, n, now)
+		if err != nil {
+			t.Fatalf("allow: %v", err)
+		}
+		return d
+	}
+
+	if d := allow(a, 10); !d.Allowed {
 		t.Fatalf("install A first 10 denied")
 	}
-	if d, _ := c.Allow(ctx, a, lim, 1, now); d.Allowed {
+	if d := allow(a, 1); d.Allowed {
 		t.Errorf("install A 11th allowed, want rate limited")
 	}
 	// Different install, same tenant, same second: unaffected.
-	if d, _ := c.Allow(ctx, b, lim, 10, now); !d.Allowed {
+	if d := allow(b, 10); !d.Allowed {
 		t.Errorf("install B denied by install A's limit — rate limit is keyed wrong")
 	}
 }
@@ -73,11 +81,17 @@ func TestRateLimitWindowRollsOver(t *testing.T) {
 	lim := limits.Quota{DailyEvents: 1_000_000, RPS: 5}
 	now := time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC)
 
-	_, _ = c.Allow(ctx, cl, lim, 5, now)
-	if d, _ := c.Allow(ctx, cl, lim, 1, now); d.Allowed {
+	if _, err := c.Allow(ctx, cl, lim, 5, now); err != nil {
+		t.Fatalf("allow: %v", err)
+	}
+	if d, err := c.Allow(ctx, cl, lim, 1, now); err != nil {
+		t.Fatalf("allow: %v", err)
+	} else if d.Allowed {
 		t.Fatalf("6th in the same second allowed")
 	}
-	if d, _ := c.Allow(ctx, cl, lim, 1, now.Add(time.Second)); !d.Allowed {
+	if d, err := c.Allow(ctx, cl, lim, 1, now.Add(time.Second)); err != nil {
+		t.Fatalf("allow: %v", err)
+	} else if !d.Allowed {
 		t.Errorf("next second denied, want allowed")
 	}
 }

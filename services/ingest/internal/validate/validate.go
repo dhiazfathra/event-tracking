@@ -10,6 +10,7 @@ package validate
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -26,6 +27,7 @@ const (
 	CodeMissingName         = "MISSING_NAME"
 	CodeNameTooLong         = "NAME_TOO_LONG"
 	CodeMissingDeviceID     = "MISSING_DEVICE_ID"
+	CodeBadTsClient         = "BAD_TS_CLIENT"
 	CodeTooManyProps        = "TOO_MANY_PROPS"
 	CodePropKeyTooLong      = "PROP_KEY_TOO_LONG"
 	CodeInvalidPropertyType = "INVALID_PROPERTY_TYPE"
@@ -34,6 +36,15 @@ const (
 const (
 	maxNameLen    = 255
 	maxPropKeyLen = 128
+)
+
+// minTsClientMS and maxTsClientMS bound what ClickHouse's DateTime64(3, 'UTC')
+// column can store. Anything outside this range fails the insert, which turns
+// into the per-batch 503 path instead of a per-event reject — the whole point
+// of this package. Reject it here instead.
+var (
+	minTsClientMS = time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	maxTsClientMS = time.Date(2299, 12, 31, 23, 59, 59, 999000000, time.UTC).UnixMilli()
 )
 
 // Event returns nil if the event is storable, or a Reject naming the first
@@ -47,8 +58,8 @@ func Event(e *trackingv1.Event) *trackingv1.Reject {
 	if e.GetEventId() == "" {
 		return reject(CodeMissingEventID, "event_id is required")
 	}
-	if _, err := uuid.Parse(e.GetEventId()); err != nil {
-		return reject(CodeBadEventID, "event_id must be a UUID")
+	if id, err := uuid.Parse(e.GetEventId()); err != nil || id.String() != e.GetEventId() {
+		return reject(CodeBadEventID, "event_id must be a canonical UUID")
 	}
 	if e.GetName() == "" {
 		return reject(CodeMissingName, "name is required")
@@ -58,6 +69,9 @@ func Event(e *trackingv1.Event) *trackingv1.Reject {
 	}
 	if e.GetDeviceId() == "" {
 		return reject(CodeMissingDeviceID, "device_id is required")
+	}
+	if ts := e.GetTsClient(); ts < minTsClientMS || ts > maxTsClientMS {
+		return reject(CodeBadTsClient, "ts_client is out of range")
 	}
 
 	// Bounds the ClickHouse JSON subcolumn explosion. The limit is a stated

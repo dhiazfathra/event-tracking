@@ -4,12 +4,20 @@ package handler_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
 	trackingv1 "github.com/dhiazfathra/event-tracking/gen/go/tracking/v1"
-	"github.com/dhiazfathra/event-tracking/pkg/clickhouse"
 )
+
+// testTSClient is a fixed offset from "now" rather than a hardcoded epoch
+// constant, so this test doesn't rot into a stale, unrelated failure (the
+// skew clamp) as real calendar time moves past a hardcoded date.
+func testTSClient() string {
+	return fmt.Sprintf("%d", time.Now().Add(-time.Hour).UnixMilli())
+}
 
 // Exchange a token, post a batch, read it back out of a real ClickHouse.
 // A green unit suite can still ship a service that has never written a row.
@@ -30,7 +38,7 @@ func TestExchangeThenIngestThenQuery(t *testing.T) {
 
 	body := batchJSON(t, []map[string]any{
 		{"eventId": "0191f4a2-1c3d-7000-8000-0000000000e1", "name": "checkout", "deviceId": "d1", "sessionId": "s1",
-			"userId": "u1", "tsClient": "1754092800000",
+			"userId": "u1", "tsClient": testTSClient(),
 			"props": map[string]any{"amount": map[string]any{"numberValue": 19.99}}},
 	})
 	rec := postWithToken(t, env.Batch, body, tok.AccessToken)
@@ -70,7 +78,7 @@ func TestReplayIsIdempotent(t *testing.T) {
 
 	body := batchJSON(t, []map[string]any{
 		{"eventId": "0191f4a2-1c3d-7000-8000-0000000000e2", "name": "checkout", "deviceId": "d1", "sessionId": "s1",
-			"tsClient": "1754092800000"},
+			"tsClient": testTSClient()},
 	})
 
 	for i := 0; i < 3; i++ {
@@ -96,7 +104,6 @@ func TestReplayIsIdempotent(t *testing.T) {
 	if n != 1 {
 		t.Errorf("rows after merge = %d, want 1 — the ts must be stable across replays", n)
 	}
-	_ = clickhouse.Row{}
 }
 
 // The exchange and the batch endpoint must agree on one key source. An
@@ -109,7 +116,7 @@ func TestExchangedTokenVerifiesAtBatch(t *testing.T) {
 	token := exchangeToken(t, env)
 	rec := postWithToken(t, env.Batch, batchJSON(t, []map[string]any{
 		{"eventId": "0191f4a2-1c3d-7000-8000-0000000000e3", "name": "checkout",
-			"deviceId": "d1", "sessionId": "s1", "tsClient": "1754092800000"},
+			"deviceId": "d1", "sessionId": "s1", "tsClient": testTSClient()},
 	}), token)
 
 	if rec.Code == http.StatusUnauthorized {

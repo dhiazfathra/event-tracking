@@ -11,3 +11,5 @@
 -- original offset.
 ALTER TABLE session_offsets
     ADD COLUMN last_seen TIMESTAMPTZ NOT NULL DEFAULT now();
+
+CREATE INDEX session_offsets_last_seen ON session_offsets (last_seen);

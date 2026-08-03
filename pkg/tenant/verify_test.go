@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,7 +26,7 @@ const (
 
 type jwksServer struct {
 	*httptest.Server
-	hits int
+	hits atomic.Int64
 }
 
 func newJWKS(t *testing.T, kid string, pub ed25519.PublicKey, use, kty string) *jwksServer {
@@ -41,7 +42,7 @@ func newJWKS(t *testing.T, kid string, pub ed25519.PublicKey, use, kty string) *
 
 	s := &jwksServer{}
 	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.hits++
+		s.hits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(set)
 	}))
@@ -266,13 +267,13 @@ func TestVerifyForgedKIDRefetchesAtMostOnce(t *testing.T) {
 	if _, err := v.Verify(context.Background(), mint(t, priv, "kid-1", nil), time.Now()); err != nil {
 		t.Fatalf("prime: %v", err)
 	}
-	before := js.hits
+	before := js.hits.Load()
 
 	for i := 0; i < 20; i++ {
 		_, _ = v.Verify(context.Background(), mint(t, priv, "forged-kid", nil), time.Now())
 	}
 
-	if extra := js.hits - before; extra > 1 {
+	if extra := js.hits.Load() - before; extra > 1 {
 		t.Errorf("JWKS refetches for forged kid = %d, want at most 1", extra)
 	}
 }

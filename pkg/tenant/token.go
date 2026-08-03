@@ -36,14 +36,18 @@ type Claims struct {
 // Minter issues short-lived EdDSA-signed ingest tokens for one signing key.
 type Minter struct {
 	kid      string
-	priv     ed25519.PrivateKey
+	key      jwk.Key
 	issuer   string
 	audience string
 	ttl      time.Duration
 }
 
-func NewMinter(kid string, priv ed25519.PrivateKey, issuer, audience string, ttl time.Duration) *Minter {
-	return &Minter{kid: kid, priv: priv, issuer: issuer, audience: audience, ttl: ttl}
+func NewMinter(kid string, priv ed25519.PrivateKey, issuer, audience string, ttl time.Duration) (*Minter, error) {
+	key, err := jwk.Import(priv)
+	if err != nil {
+		return nil, fmt.Errorf("import key: %w", err)
+	}
+	return &Minter{kid: kid, key: key, issuer: issuer, audience: audience, ttl: ttl}, nil
 }
 
 // Mint issues a short-lived ingest token. The token, not the embedded client
@@ -73,12 +77,7 @@ func (m *Minter) Mint(c Claims, now time.Time) (string, int64, error) {
 		return "", 0, fmt.Errorf("set kid header: %w", err)
 	}
 
-	key, err := jwk.Import(m.priv)
-	if err != nil {
-		return "", 0, fmt.Errorf("import key: %w", err)
-	}
-
-	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.EdDSA(), key, jws.WithProtectedHeaders(hdrs)))
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.EdDSA(), m.key, jws.WithProtectedHeaders(hdrs)))
 	if err != nil {
 		return "", 0, fmt.Errorf("sign: %w", err)
 	}
