@@ -4,6 +4,7 @@ use (
 	./gen/go
 	./pkg/clickhouse
 	./pkg/limits
+	./pkg/tenant
 	./pkg/testsupport
 	./tools
 )
