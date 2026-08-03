@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS events
     trust_tier    UInt8,
     install_id    String,
 
-    props         JSON,
+    props         String,
 
     INDEX idx_user  user_id    TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_sess  session_id TYPE bloom_filter(0.01) GRANULARITY 4
