@@ -67,3 +67,35 @@ jobs:
 
       - name: Go tests
         run: make test
+
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
+        with:
+          go-version: '1.23'
+      - name: Unit tests
+        run: cd services/ingest && go test -race ./...
+      - name: Integration tests
+        run: |
+          cd pkg/clickhouse && go test ./...
+          cd ../controlplane && go test ./...
+          cd ../../services/ingest && go test -tags e2e ./...
+      # `build` alone would not catch a broken healthcheck or a service that
+      # exits on startup. `up --wait` blocks until every *declared* healthcheck
+      # passes — but ingest's distroless image has no shell to run one, so
+      # `--wait` returns as soon as the container starts. Poll /readyz
+      # ourselves to actually verify the service came up, not just the
+      # container.
+      - name: Compose stack comes up healthy
+        run: |
+          docker compose -f deploy/docker-compose.yml up -d --wait --build ingest
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/readyz; then break; fi
+            if [ "$i" -eq 30 ]; then echo "ingest never became ready"; exit 1; fi
+            sleep 1
+          done
+          docker compose -f deploy/docker-compose.yml down -v

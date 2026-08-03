@@ -26,9 +26,12 @@ check-boundaries:
 test:
 	@for d in $$(go list -m -f '{{.Dir}}'); do (cd "$$d" && go test ./...) || exit 1; done
 
-# The embed in pkg/clickhouse/migrate.go reads from pkg/clickhouse/sql, copied
-# from migrations/clickhouse. This rule keeps the copy from going stale.
+# The embeds in pkg/clickhouse/migrate.go and pkg/controlplane/migrate.go read
+# from pkg/clickhouse/sql and pkg/controlplane/sql, copied from migrations/.
+# This rule keeps both copies from going stale.
 sync-migrations:
-	rm -rf pkg/clickhouse/sql && mkdir -p pkg/clickhouse/sql
+	rm -rf pkg/clickhouse/sql pkg/controlplane/sql
+	mkdir -p pkg/clickhouse/sql pkg/controlplane/sql
 	cp migrations/clickhouse/*.sql pkg/clickhouse/sql/
-	git diff --exit-code -- pkg/clickhouse/sql
+	cp migrations/postgres/*.sql pkg/controlplane/sql/
+	git diff --exit-code -- pkg/clickhouse/sql pkg/controlplane/sql
