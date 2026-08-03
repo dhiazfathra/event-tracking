@@ -25,23 +25,23 @@ import (
 )
 
 // Deps wires everything the handler needs.
-//
-// NOTE: the design brief for this task specs Verifier.VerifyOrLegacy plus a
-// Legacy resolver / OnLegacyUse hook, added by a later task (pre-token
-// wk_live_ write-key cutover) that has not landed in this worktree — pkg/tenant
-// only exposes Verify. This wires against the interface that actually exists
-// today (tenant.Verify, Task 4) rather than inventing the legacy cutover
-// machinery here. Swapping in VerifyOrLegacy once that task lands is a
-// same-file, few-line change: replace the Verify call below and add the two
-// fields back to Deps.
 type Deps struct {
 	Verifier *tenant.Verifier
+
+	// Legacy resolves pre-token wk_live_ write keys during the cutover. Without
+	// it every legacy credential goes to JWT parsing and fails, so the staged
+	// deprecation never actually runs.
+	Legacy tenant.LegacyResolver
 
 	Offsets   enrich.OffsetStore
 	Quota     *quota.Checker
 	LimitsFor func(ctx context.Context, tenantID string, tier uint8) (limits.Quota, error)
 	Insert    func(ctx context.Context, rows []clickhouse.Row) error
 	Now       func() time.Time
+
+	// OnLegacyUse counts legacy credential usage per tenant and SDK version.
+	// That count is what tells you when a cutoff is safe.
+	OnLegacyUse func(tenantID, sdkVersion string)
 }
 
 func NewBatch(d Deps) http.Handler {
@@ -51,11 +51,13 @@ func NewBatch(d Deps) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedAt := d.Now()
 
-		claims, err := d.Verifier.Verify(r.Context(), r.Header.Get("Authorization"), receivedAt)
+		claims, isLegacy, err := d.Verifier.VerifyOrLegacy(
+			r.Context(), r.Header.Get("Authorization"), receivedAt, d.Legacy)
 		if err != nil {
 			// 401 tells the client to re-exchange for a fresh token and retry
 			// once. Any other code here would make an expired token look like
-			// a permanent failure and stop the device syncing.
+			// a permanent failure and stop the device syncing. A cutoff legacy
+			// key lands here too, which is the intended end state.
 			httpError(w, http.StatusUnauthorized, "invalid token")
 			return
 		}
@@ -88,6 +90,14 @@ func NewBatch(d Deps) http.Handler {
 			return
 		}
 
+		if isLegacy && d.OnLegacyUse != nil {
+			var sdkVersion string
+			if len(req.Events) > 0 {
+				sdkVersion = req.Events[0].GetContext().GetSdkVersion()
+			}
+			d.OnLegacyUse(claims.TenantID, sdkVersion)
+		}
+
 		resp := &trackingv1.BatchResponse{ReceivedAt: receivedAt.UnixMilli()}
 
 		// Validate before quota: a malformed event never reaches storage, so it
@@ -106,6 +116,11 @@ func NewBatch(d Deps) http.Handler {
 		if err != nil {
 			httpError(w, http.StatusServiceUnavailable, "limits unavailable")
 			return
+		}
+		if isLegacy {
+			// Below tier 1, deliberately. Deprecation pressure that the SDK
+			// already knows how to absorb, since it backs off on 429.
+			lim.RPS = lim.LegacyRPS
 		}
 
 		dec, err := d.Quota.Allow(r.Context(), claims, lim, len(valid), receivedAt)

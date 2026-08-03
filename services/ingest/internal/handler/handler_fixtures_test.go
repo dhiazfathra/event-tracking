@@ -248,6 +248,46 @@ func newTestHandlerFailingOffsets(t *testing.T) http.Handler {
 	return authWrapper(h, token)
 }
 
+// legacyResolver returns the same (tenantID, mode) for any wk_live_ key.
+type legacyResolver struct {
+	tenantID string
+	mode     tenant.LegacyMode
+}
+
+func (r legacyResolver) Resolve(context.Context, string) (string, tenant.LegacyMode, error) {
+	return r.tenantID, r.mode, nil
+}
+
+// newTestHandlerWithLegacy wires a Legacy resolver returning ("t1", mode, nil)
+// for any wk_live_ key, so tests can drive the dual-accept/cutoff cutover
+// without a live tenant DB.
+func newTestHandlerWithLegacy(t *testing.T, mode tenant.LegacyMode) (http.Handler, *sink) {
+	t.Helper()
+	js, priv := newJWKS(t)
+	verifier := tenant.NewVerifier(js.URL, testIssuer, testAudience, js.Client())
+	rdb := startRedis(t)
+
+	s := &sink{}
+	offsets := &recordingOffsets{inner: enrich.NewMemoryOffsetStore(), sink: s}
+	token := mintToken(t, priv)
+
+	h := handler.NewBatch(handler.Deps{
+		Verifier:  verifier,
+		Legacy:    legacyResolver{tenantID: "t1", mode: mode},
+		Offsets:   offsets,
+		Quota:     quota.NewChecker(rdb),
+		LimitsFor: unlimitedLimits,
+		Insert: func(_ context.Context, rows []clickhouse.Row) error {
+			s.rows = append(s.rows, rows...)
+			return nil
+		},
+	})
+
+	// No auto-injected token: legacy tests supply their own Authorization
+	// header via postWithAuth.
+	return authWrapper(h, token), s
+}
+
 func batchJSON(t *testing.T, events []map[string]any) []byte {
 	t.Helper()
 	body := map[string]any{
@@ -282,6 +322,18 @@ func post(t *testing.T, h http.Handler, body []byte, gz bool) *httptest.Response
 	if gz {
 		req.Header.Set("Content-Encoding", "gzip")
 	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// postWithAuth is post() with an explicit Authorization header, for tests
+// that need to present a credential other than the fixture's default JWT
+// (e.g. a legacy wk_live_ write key).
+func postWithAuth(t *testing.T, h http.Handler, body []byte, auth string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/batch", bytes.NewReader(body))
+	req.Header.Set("Authorization", auth)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec

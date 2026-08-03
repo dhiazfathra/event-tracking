@@ -8,6 +8,7 @@ import (
 
 	trackingv1 "github.com/dhiazfathra/event-tracking/gen/go/tracking/v1"
 	"github.com/dhiazfathra/event-tracking/pkg/limits"
+	"github.com/dhiazfathra/event-tracking/pkg/tenant"
 )
 
 // One malformed event must not fail the batch. This is the single most
@@ -213,5 +214,30 @@ func TestOffsetStoreFailureReturns503(t *testing.T) {
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", rec.Code)
+	}
+}
+
+// Legacy write keys must reach the legacy path, not JWT parsing.
+func TestLegacyWriteKeyIsAccepted(t *testing.T) {
+	h, sink := newTestHandlerWithLegacy(t, tenant.ModeDualAccept)
+
+	rec := postWithAuth(t, h, batchJSON(t, []map[string]any{
+		{"eventId": "0191f4a2-1c3d-7000-8000-000000000001", "name": "n", "deviceId": "d1", "tsClient": "1754092800000"},
+	}), "Bearer wk_live_abc123")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body)
+	}
+	if len(sink.rows) != 1 || sink.rows[0].TrustTier != 1 {
+		t.Errorf("legacy row = %+v, want one row at tier 1", sink.rows)
+	}
+}
+
+func TestLegacyWriteKeyRejectedAtCutoff(t *testing.T) {
+	h, _ := newTestHandlerWithLegacy(t, tenant.ModeCutoff)
+
+	rec := postWithAuth(t, h, batchJSON(t, nil), "Bearer wk_live_abc123")
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 after cutoff", rec.Code)
 	}
 }
