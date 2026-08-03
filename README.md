@@ -2,7 +2,7 @@
 
 Multi-tenant event tracking platform: Go services + ClickHouse for ingestion, storage, and querying, with a local-first Flutter SDK for offline event capture and background sync.
 
-**Status: design only.** No implementation yet. The design is approved and documented; the next step is an implementation plan.
+**Status: `services/ingest` implemented.** `services/query` and the Flutter SDK are still design only.
 
 ## Design
 

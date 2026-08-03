@@ -50,6 +50,10 @@ harmful in this market: Indonesian carriers CGNAT aggressively, so one
 Telkomsel egress IP is thousands of real users. IP survives only as a coarse
 anomaly signal.
 
+`POST /v1/auth/token` is separately rate-limited per `client_id` (30/minute)
+to bound install-row write amplification from `device_hint` churn — see
+`tokenRatePerMinute` in `internal/handler/token.go`.
+
 ## Local development
 
 ```bash
