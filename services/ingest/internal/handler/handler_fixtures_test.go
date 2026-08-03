@@ -19,6 +19,8 @@ import (
 	"github.com/lestrrat-go/jwx/v3/jws"
 	"github.com/lestrrat-go/jwx/v3/jwt"
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/dhiazfathra/event-tracking/pkg/clickhouse"
 	"github.com/dhiazfathra/event-tracking/pkg/limits"
@@ -348,9 +350,22 @@ func postWithAuth(t *testing.T, h http.Handler, body []byte, auth string) *httpt
 	return rec
 }
 
-func decode(t *testing.T, b []byte, v any) {
+// decode unmarshals an HTTP handler's response body into a proto message.
+//
+// The handlers marshal responses with protojson.Marshal, which by default
+// emits each field's camelCase JSON name (e.g. "trustTier", "accessToken") —
+// not the snake_case name in the struct's `json:` tag that protoc-gen-go adds
+// alongside the `protobuf:` tag. encoding/json.Unmarshal only recognizes the
+// struct's `json:` tag, so it silently leaves every renamed field at its zero
+// value instead of erroring: TrustTier decodes to 0, AccessToken decodes to
+// "". Fields whose camelCase and snake_case forms happen to coincide (single
+// word names like "accepted") decode correctly either way, which is why this
+// bug hid behind passing assertions on those fields. protojson.Unmarshal
+// accepts either naming convention, matching what protojson.Marshal actually
+// produced.
+func decode(t *testing.T, b []byte, v proto.Message) {
 	t.Helper()
-	if err := json.Unmarshal(b, v); err != nil {
+	if err := protojson.Unmarshal(b, v); err != nil {
 		t.Fatalf("decode response: %v (body: %s)", err, b)
 	}
 }
