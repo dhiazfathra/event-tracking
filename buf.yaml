@@ -10,3 +10,8 @@ breaking:
   use:
     - FILE
     - WIRE_JSON
+  ignore:
+    # Ingest proto is still unreleased (built across this branch, no client
+    # has ever consumed it) — the TrustTier enum -> uint32 change is a
+    # deliberate in-development revision, not a break against a live API.
+    - proto/tracking/v1/ingest.proto
