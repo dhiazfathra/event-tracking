@@ -131,7 +131,7 @@ func startClickHouse(t *testing.T) chdriver.Conn {
 
 	container, err := tcch.Run(ctx, "clickhouse/clickhouse-server:24.8-alpine",
 		tcch.WithUsername("default"),
-		tcch.WithPassword(""),
+		tcch.WithPassword("test"),
 		tcch.WithDatabase("tracking_test"),
 	)
 	if err != nil {
@@ -146,7 +146,7 @@ func startClickHouse(t *testing.T) chdriver.Conn {
 
 	conn, err := ch.Open(&ch.Options{
 		Addr: []string{host},
-		Auth: ch.Auth{Database: "tracking_test", Username: "default"},
+		Auth: ch.Auth{Database: "tracking_test", Username: "default", Password: "test"},
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
