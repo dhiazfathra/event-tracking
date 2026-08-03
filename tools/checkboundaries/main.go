@@ -23,8 +23,10 @@ import (
 const modulePrefix = "github.com/dhiazfathra/event-tracking/"
 
 type pkgInfo struct {
-	ImportPath string
-	Imports    []string
+	ImportPath   string
+	Imports      []string
+	TestImports  []string
+	XTestImports []string
 }
 
 func main() {
@@ -36,7 +38,8 @@ func main() {
 
 	var all []string
 	for _, p := range pkgs {
-		all = append(all, violations(p.ImportPath, p.Imports)...)
+		imports := append(append(append([]string{}, p.Imports...), p.TestImports...), p.XTestImports...)
+		all = append(all, violations(p.ImportPath, imports)...)
 	}
 
 	if len(all) > 0 {
