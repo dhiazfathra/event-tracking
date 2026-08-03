@@ -30,8 +30,17 @@ message TokenRequest {
   string attestation = 3;   // App Attest / Play Integrity blob; may be empty
 }
 
+// TrustTier is deliberately non-zero for real states: proto3 decodes an
+// omitted field as 0, so if 0 meant "attested" a missing trust_tier would be
+// indistinguishable from an attested response.
+enum TrustTier {
+  TRUST_TIER_UNSPECIFIED         = 0;
+  TRUST_TIER_ATTESTED            = 1;
+  TRUST_TIER_ATTESTATION_UNAVAILABLE = 2;
+}
+
 message TokenResponse {
-  string access_token = 1;  // EdDSA JWT, typ=at+jwt
-  int64  expires_in   = 2;  // seconds; 1800-3600
-  uint32 trust_tier   = 3;  // 0 = attested, 1 = attestation unavailable
+  string    access_token = 1;  // EdDSA JWT, typ=at+jwt
+  int64     expires_in   = 2;  // seconds; 1800-3600
+  TrustTier trust_tier   = 3;
 }

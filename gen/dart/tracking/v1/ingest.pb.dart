@@ -15,6 +15,9 @@ import 'package:fixnum/fixnum.dart' as $fixnum;
 import 'package:protobuf/protobuf.dart' as $pb;
 
 import 'event.pb.dart' as $0;
+import 'ingest.pbenum.dart';
+
+export 'ingest.pbenum.dart';
 
 class BatchRequest extends $pb.GeneratedMessage {
   factory BatchRequest({
@@ -303,7 +306,7 @@ class TokenResponse extends $pb.GeneratedMessage {
   factory TokenResponse({
     $core.String? accessToken,
     $fixnum.Int64? expiresIn,
-    $core.int? trustTier,
+    TrustTier? trustTier,
   }) {
     final $result = create();
     if (accessToken != null) {
@@ -324,7 +327,7 @@ class TokenResponse extends $pb.GeneratedMessage {
   static final $pb.BuilderInfo _i = $pb.BuilderInfo(_omitMessageNames ? '' : 'TokenResponse', package: const $pb.PackageName(_omitMessageNames ? '' : 'tracking.v1'), createEmptyInstance: create)
     ..aOS(1, _omitFieldNames ? '' : 'accessToken')
     ..aInt64(2, _omitFieldNames ? '' : 'expiresIn')
-    ..a<$core.int>(3, _omitFieldNames ? '' : 'trustTier', $pb.PbFieldType.OU3)
+    ..e<TrustTier>(3, _omitFieldNames ? '' : 'trustTier', $pb.PbFieldType.OE, defaultOrMaker: TrustTier.TRUST_TIER_UNSPECIFIED, valueOf: TrustTier.valueOf, enumValues: TrustTier.values)
     ..hasRequiredFields = false
   ;
 
@@ -368,9 +371,9 @@ class TokenResponse extends $pb.GeneratedMessage {
   void clearExpiresIn() => clearField(2);
 
   @$pb.TagNumber(3)
-  $core.int get trustTier => $_getIZ(2);
+  TrustTier get trustTier => $_getN(2);
   @$pb.TagNumber(3)
-  set trustTier($core.int v) { $_setUnsignedInt32(2, v); }
+  set trustTier(TrustTier v) { setField(3, v); }
   @$pb.TagNumber(3)
   $core.bool hasTrustTier() => $_has(2);
   @$pb.TagNumber(3)
