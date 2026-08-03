@@ -92,11 +92,18 @@ jobs:
       # container.
       - name: Compose stack comes up healthy
         run: |
-          docker compose -f deploy/docker-compose.yml up -d --wait --build ingest
+          # No --wait: ingest has no healthcheck, and --wait fails the whole
+          # step the instant the container exits, before the log dump below
+          # ever runs. Bringing dependencies up with --wait, then ingest
+          # without it, means a crashing ingest container still falls through
+          # to the readiness loop and its diagnostic log dump.
+          docker compose -f deploy/docker-compose.yml up -d --wait clickhouse postgres redis
+          docker compose -f deploy/docker-compose.yml up -d --build ingest
           for i in $(seq 1 30); do
             if curl -sf http://localhost:8080/readyz; then break; fi
-            if [ "$i" -eq 30 ]; then
-              echo "ingest never became ready"
+            state=$(docker inspect -f '{{.State.Status}}' deploy-ingest-1 2>/dev/null || echo unknown)
+            if [ "$state" = "exited" ] || [ "$i" -eq 30 ]; then
+              echo "ingest never became ready (container state: $state)"
               docker compose -f deploy/docker-compose.yml logs --no-color
               exit 1
             fi
