@@ -54,13 +54,13 @@ make gen               # regenerate gen/ from proto/ — commit the result
 make gen-check         # CI gate: fails if gen/ is stale
 make lint              # buf lint + golangci-lint
 make check-boundaries  # enforce the three module rules
-make test              # go test ./...
+make test              # test each Go workspace module
 ```
 
 ### Module rules
 
 1. `services/*` may not import each other — shared logic moves to `pkg/`.
-2. `clients/flutter_sdk` and `services/*` share exactly one thing: `gen/`.
+2. `clients/flutter_sdk` and `services/*` share exactly one *dependency*: `gen/`. (`testdata/golden/` is a shared test fixture path, not a dependency, and is fine on both sides.)
 3. `pkg/*` may not import `services/*`.
 
 Rules 1 and 3 are enforced by `tools/checkboundaries` in CI. **Rule 2 is not** —

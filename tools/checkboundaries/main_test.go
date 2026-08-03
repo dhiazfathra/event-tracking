@@ -1,6 +1,25 @@
 package main
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
+
+func TestMergedImports(t *testing.T) {
+	p := pkgInfo{
+		Imports:      []string{"a"},
+		TestImports:  []string{"b"},
+		XTestImports: []string{"c"},
+	}
+	got := mergedImports(p)
+	want := []string{"a", "b", "c"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("mergedImports = %v, want %v", got, want)
+	}
+	if len(p.Imports) != 1 {
+		t.Errorf("mergedImports mutated source Imports slice: %v", p.Imports)
+	}
+}
 
 func TestViolations(t *testing.T) {
 	cases := []struct {

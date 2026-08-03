@@ -38,8 +38,7 @@ func main() {
 
 	var all []string
 	for _, p := range pkgs {
-		imports := append(append(append([]string{}, p.Imports...), p.TestImports...), p.XTestImports...)
-		all = append(all, violations(p.ImportPath, imports)...)
+		all = append(all, violations(p.ImportPath, mergedImports(p))...)
 	}
 
 	if len(all) > 0 {
@@ -50,6 +49,12 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("module boundaries OK")
+}
+
+// mergedImports combines a package's regular, internal-test, and
+// external-test imports without mutating any source slice.
+func mergedImports(p pkgInfo) []string {
+	return append(append(append([]string{}, p.Imports...), p.TestImports...), p.XTestImports...)
 }
 
 // listPackages runs `go list -json ./...` inside each workspace module's own
