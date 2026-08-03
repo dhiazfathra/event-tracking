@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS events
 
     ts            DateTime64(3, 'UTC'),   -- skew-corrected. Queries use this.
     ts_client     DateTime64(3, 'UTC'),   -- raw device clock, kept for forensics
-    ts_received   DateTime64(3, 'UTC'),   -- server receipt; ReplacingMergeTree version
+    ts_received   DateTime64(3, 'UTC'),   -- server receipt, ReplacingMergeTree version
     event_date    Date MATERIALIZED toDate(ts),
 
     user_id       String,
