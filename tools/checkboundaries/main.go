@@ -62,18 +62,23 @@ func mergedImports(p pkgInfo) []string {
 // (only go.work lives there), so `./...` run from the root cannot resolve —
 // it must be run from within each module's directory tree instead.
 func listPackages() ([]pkgInfo, error) {
-	dirsOut, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}").Output()
+	var stderr bytes.Buffer
+	dirsCmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}")
+	dirsCmd.Stderr = &stderr
+	dirsOut, err := dirsCmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("go list -m: %w", err)
+		return nil, fmt.Errorf("go list -m: %w: %s", err, stderr.String())
 	}
 
 	var pkgs []pkgInfo
 	for _, dir := range strings.Fields(string(dirsOut)) {
 		cmd := exec.Command("go", "list", "-json", "./...")
 		cmd.Dir = dir
+		var cmdStderr bytes.Buffer
+		cmd.Stderr = &cmdStderr
 		out, err := cmd.Output()
 		if err != nil {
-			return nil, fmt.Errorf("go list ./... in %s: %w", dir, err)
+			return nil, fmt.Errorf("go list ./... in %s: %w: %s", dir, err, cmdStderr.String())
 		}
 		// `go list -json` emits consecutive top-level objects, not a JSON
 		// array. Decoder.More() is only meaningful inside an array or
