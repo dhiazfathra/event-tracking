@@ -1,4 +1,4 @@
-.PHONY: gen gen-check lint test check-boundaries
+.PHONY: gen gen-check lint test check-boundaries sync-migrations
 
 gen:
 	buf generate
@@ -25,3 +25,10 @@ check-boundaries:
 # module's own directory instead — scoped to just this repo's code.
 test:
 	@for d in $$(go list -m -f '{{.Dir}}'); do (cd "$$d" && go test ./...) || exit 1; done
+
+# The embed in pkg/clickhouse/migrate.go reads from pkg/clickhouse/sql, copied
+# from migrations/clickhouse. This rule keeps the copy from going stale.
+sync-migrations:
+	rm -rf pkg/clickhouse/sql && mkdir -p pkg/clickhouse/sql
+	cp migrations/clickhouse/*.sql pkg/clickhouse/sql/
+	git diff --exit-code -- pkg/clickhouse/sql
