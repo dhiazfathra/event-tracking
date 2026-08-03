@@ -24,6 +24,10 @@ It covers the high-level architecture, monorepo layout and module boundaries, th
 
 Decisions are not deleted when they change. Supersede them with a new ADR that references the old one.
 
+## Services
+
+- [`services/ingest`](services/ingest/README.md) — token exchange and event ingestion
+
 ## Planned Layout
 
 ```text
