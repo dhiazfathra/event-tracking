@@ -88,13 +88,27 @@ func NewBatch(d Deps) http.Handler {
 			return
 		}
 
+		resp := &trackingv1.BatchResponse{ReceivedAt: receivedAt.UnixMilli()}
+
+		// Validate before quota: a malformed event never reaches storage, so it
+		// must never spend budget either. Otherwise a client bug that spams
+		// garbage events burns real quota and 429s the tenant's valid traffic.
+		valid := make([]*trackingv1.Event, 0, len(req.Events))
+		for _, e := range req.Events {
+			if rej := validate.Event(e); rej != nil {
+				resp.Rejected = append(resp.Rejected, rej)
+				continue
+			}
+			valid = append(valid, e)
+		}
+
 		lim, err := d.LimitsFor(r.Context(), claims.TenantID, claims.TrustTier)
 		if err != nil {
 			httpError(w, http.StatusServiceUnavailable, "limits unavailable")
 			return
 		}
 
-		dec, err := d.Quota.Allow(r.Context(), claims, lim, len(req.Events), receivedAt)
+		dec, err := d.Quota.Allow(r.Context(), claims, lim, len(valid), receivedAt)
 		if err != nil {
 			httpError(w, http.StatusServiceUnavailable, "quota unavailable")
 			return
@@ -105,20 +119,14 @@ func NewBatch(d Deps) http.Handler {
 			return
 		}
 
-		resp := &trackingv1.BatchResponse{ReceivedAt: receivedAt.UnixMilli()}
-		rows := make([]clickhouse.Row, 0, len(req.Events))
-		accepted := make([]string, 0, len(req.Events))
+		rows := make([]clickhouse.Row, 0, len(valid))
+		accepted := make([]string, 0, len(valid))
 
 		// Offsets are memoised per (device, session) within the batch, so a
 		// 500-event batch from one session is still one store round-trip.
 		offsets := map[enrich.SessionKey]int64{}
 
-		for _, e := range req.Events {
-			if rej := validate.Event(e); rej != nil {
-				resp.Rejected = append(resp.Rejected, rej)
-				continue
-			}
-
+		for _, e := range valid {
 			key := enrich.SessionKey{
 				TenantID:  claims.TenantID,
 				DeviceID:  e.GetDeviceId(),

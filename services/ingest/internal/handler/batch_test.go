@@ -174,6 +174,37 @@ func TestOffsetIsResolvedPerSessionNotPerBatch(t *testing.T) {
 // An offset the store cannot resolve must not be silently replaced with zero:
 // a replay would then land at a different ts, move under the sort key, and stop
 // deduplicating. Fail the batch instead — the client still holds the events.
+// Quota is checked after validation, against the surviving event count. A
+// batch of nothing but malformed events must consume zero budget — otherwise
+// a client bug that spams garbage events burns real quota and 429s the
+// tenant's valid traffic. Bug: https://github.com/dhiazfathra/event-tracking
+// task-9 review — quota.Allow(n) was called with len(req.Events) before
+// filtering, so rejected events were charged.
+func TestRejectedEventsDoNotConsumeQuota(t *testing.T) {
+	h, sink := newTestHandlerWithQuota(t, 1) // budget for exactly one valid event
+
+	// First request: all events malformed. Must not touch the budget.
+	garbage := batchJSON(t, []map[string]any{
+		{"eventId": "not-a-uuid", "name": "bad", "deviceId": "d1", "tsClient": "1754092800000"},
+	})
+	if rec := post(t, h, garbage, false); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (malformed events are a partial-success reject, not a batch failure)", rec.Code)
+	}
+
+	// Second request: one valid event. If the first request had spent the
+	// budget, this would 429 instead.
+	good := batchJSON(t, []map[string]any{
+		{"eventId": "0191f4a2-1c3d-7000-8000-000000000099", "name": "n", "deviceId": "d1", "tsClient": "1754092800000"},
+	})
+	rec := post(t, h, good, false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — a batch of malformed events must not have consumed quota", rec.Code)
+	}
+	if len(sink.rows) != 1 {
+		t.Errorf("inserted %d rows, want 1", len(sink.rows))
+	}
+}
+
 func TestOffsetStoreFailureReturns503(t *testing.T) {
 	h := newTestHandlerFailingOffsets(t)
 	rec := post(t, h, batchJSON(t, []map[string]any{
