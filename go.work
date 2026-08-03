@@ -6,5 +6,6 @@ use (
 	./pkg/limits
 	./pkg/tenant
 	./pkg/testsupport
+	./services/ingest
 	./tools
 )
