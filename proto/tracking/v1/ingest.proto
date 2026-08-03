@@ -28,19 +28,17 @@ message TokenRequest {
   string client_id   = 1;   // public, embedded in the SDK, authorizes nothing
   string platform    = 2;   // "ios" | "android"
   string attestation = 3;   // App Attest / Play Integrity blob; may be empty
+  string challenge    = 4;  // server-issued nonce from /v1/auth/challenge
+  string device_hint  = 5;  // client-generated, persisted across restarts; Tier 1 anchor only
 }
 
-// TrustTier is deliberately non-zero for real states: proto3 decodes an
-// omitted field as 0, so if 0 meant "attested" a missing trust_tier would be
-// indistinguishable from an attested response.
-enum TrustTier {
-  TRUST_TIER_UNSPECIFIED         = 0;
-  TRUST_TIER_ATTESTED            = 1;
-  TRUST_TIER_ATTESTATION_UNAVAILABLE = 2;
-}
-
+// trust_tier on the wire matches the JWT claim and the ClickHouse column:
+// 0 = attested, 1 = attestation unavailable. Not an enum — this is a plain
+// tier number that has to stay bit-for-bit consistent with the uint8 claim
+// pkg/tenant mints and pkg/clickhouse stores, and juggling an enum with
+// different numbering across three layers is how they drift.
 message TokenResponse {
-  string    access_token = 1;  // EdDSA JWT, typ=at+jwt
-  int64     expires_in   = 2;  // seconds; 1800-3600
-  TrustTier trust_tier   = 3;
+  string access_token = 1;  // EdDSA JWT, typ=at+jwt
+  int64  expires_in   = 2;  // seconds; 1800-3600
+  uint32 trust_tier    = 3;
 }

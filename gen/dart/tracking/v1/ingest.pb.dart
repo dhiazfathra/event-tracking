@@ -15,9 +15,6 @@ import 'package:fixnum/fixnum.dart' as $fixnum;
 import 'package:protobuf/protobuf.dart' as $pb;
 
 import 'event.pb.dart' as $0;
-import 'ingest.pbenum.dart';
-
-export 'ingest.pbenum.dart';
 
 class BatchRequest extends $pb.GeneratedMessage {
   factory BatchRequest({
@@ -229,6 +226,8 @@ class TokenRequest extends $pb.GeneratedMessage {
     $core.String? clientId,
     $core.String? platform,
     $core.String? attestation,
+    $core.String? challenge,
+    $core.String? deviceHint,
   }) {
     final $result = create();
     if (clientId != null) {
@@ -240,6 +239,12 @@ class TokenRequest extends $pb.GeneratedMessage {
     if (attestation != null) {
       $result.attestation = attestation;
     }
+    if (challenge != null) {
+      $result.challenge = challenge;
+    }
+    if (deviceHint != null) {
+      $result.deviceHint = deviceHint;
+    }
     return $result;
   }
   TokenRequest._() : super();
@@ -250,6 +255,8 @@ class TokenRequest extends $pb.GeneratedMessage {
     ..aOS(1, _omitFieldNames ? '' : 'clientId')
     ..aOS(2, _omitFieldNames ? '' : 'platform')
     ..aOS(3, _omitFieldNames ? '' : 'attestation')
+    ..aOS(4, _omitFieldNames ? '' : 'challenge')
+    ..aOS(5, _omitFieldNames ? '' : 'deviceHint')
     ..hasRequiredFields = false
   ;
 
@@ -300,13 +307,36 @@ class TokenRequest extends $pb.GeneratedMessage {
   $core.bool hasAttestation() => $_has(2);
   @$pb.TagNumber(3)
   void clearAttestation() => clearField(3);
+
+  @$pb.TagNumber(4)
+  $core.String get challenge => $_getSZ(3);
+  @$pb.TagNumber(4)
+  set challenge($core.String v) { $_setString(3, v); }
+  @$pb.TagNumber(4)
+  $core.bool hasChallenge() => $_has(3);
+  @$pb.TagNumber(4)
+  void clearChallenge() => clearField(4);
+
+  @$pb.TagNumber(5)
+  $core.String get deviceHint => $_getSZ(4);
+  @$pb.TagNumber(5)
+  set deviceHint($core.String v) { $_setString(4, v); }
+  @$pb.TagNumber(5)
+  $core.bool hasDeviceHint() => $_has(4);
+  @$pb.TagNumber(5)
+  void clearDeviceHint() => clearField(5);
 }
 
+/// trust_tier on the wire matches the JWT claim and the ClickHouse column:
+/// 0 = attested, 1 = attestation unavailable. Not an enum — this is a plain
+/// tier number that has to stay bit-for-bit consistent with the uint8 claim
+/// pkg/tenant mints and pkg/clickhouse stores, and juggling an enum with
+/// different numbering across three layers is how they drift.
 class TokenResponse extends $pb.GeneratedMessage {
   factory TokenResponse({
     $core.String? accessToken,
     $fixnum.Int64? expiresIn,
-    TrustTier? trustTier,
+    $core.int? trustTier,
   }) {
     final $result = create();
     if (accessToken != null) {
@@ -327,7 +357,7 @@ class TokenResponse extends $pb.GeneratedMessage {
   static final $pb.BuilderInfo _i = $pb.BuilderInfo(_omitMessageNames ? '' : 'TokenResponse', package: const $pb.PackageName(_omitMessageNames ? '' : 'tracking.v1'), createEmptyInstance: create)
     ..aOS(1, _omitFieldNames ? '' : 'accessToken')
     ..aInt64(2, _omitFieldNames ? '' : 'expiresIn')
-    ..e<TrustTier>(3, _omitFieldNames ? '' : 'trustTier', $pb.PbFieldType.OE, defaultOrMaker: TrustTier.TRUST_TIER_UNSPECIFIED, valueOf: TrustTier.valueOf, enumValues: TrustTier.values)
+    ..a<$core.int>(3, _omitFieldNames ? '' : 'trustTier', $pb.PbFieldType.OU3)
     ..hasRequiredFields = false
   ;
 
@@ -371,9 +401,9 @@ class TokenResponse extends $pb.GeneratedMessage {
   void clearExpiresIn() => clearField(2);
 
   @$pb.TagNumber(3)
-  TrustTier get trustTier => $_getN(2);
+  $core.int get trustTier => $_getIZ(2);
   @$pb.TagNumber(3)
-  set trustTier(TrustTier v) { setField(3, v); }
+  set trustTier($core.int v) { $_setUnsignedInt32(2, v); }
   @$pb.TagNumber(3)
   $core.bool hasTrustTier() => $_has(2);
   @$pb.TagNumber(3)
