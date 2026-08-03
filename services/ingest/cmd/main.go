@@ -99,7 +99,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/auth/challenge", handler.NewChallenge(tokenDeps))
 	mux.Handle("POST /v1/auth/token", handler.NewToken(tokenDeps))
-	mux.Handle("GET /.well-known/jwks.json", newJWKSHandler(store))
+	mux.Handle("GET /.well-known/jwks.json", handler.NewJWKS(store))
 	mux.Handle("POST /v1/batch", handler.NewBatch(handler.Deps{
 		Verifier: verifier,
 		Legacy:   legacyResolver{store},

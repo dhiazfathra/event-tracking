@@ -4,7 +4,6 @@ package handler_test
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -61,16 +60,10 @@ func startFullStack(t *testing.T) *stack {
 
 	rdb := startRealRedis(t)
 
-	// JWKS served from the same store, so minted tokens verify.
-	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		set, err := store.PublicJWKS(r.Context())
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(set)
-	}))
+	// The real GET /.well-known/jwks.json handler from cmd/main.go's own
+	// wiring, not a reimplementation — this is what makes the test actually
+	// exercise the shipped jwks.json code path instead of a copy of it.
+	jwks := httptest.NewServer(handler.NewJWKS(store))
 	t.Cleanup(jwks.Close)
 
 	const issuer, audience = "https://issuer.e2e", "https://ingest.e2e"
