@@ -181,10 +181,15 @@ func TestOffsetIsResolvedPerSessionNotPerBatch(t *testing.T) {
 // tenant's valid traffic. Bug: https://github.com/dhiazfathra/event-tracking
 // task-9 review — quota.Allow(n) was called with len(req.Events) before
 // filtering, so rejected events were charged.
-func TestRejectedEventsDoNotConsumeQuota(t *testing.T) {
-	h, sink := newTestHandlerWithQuota(t, 1) // budget for exactly one valid event
+// A batch of entirely-malformed events still costs 1 unit of quota — the
+// floor charge that stops a client from sending unlimited all-garbage
+// batches at zero rate-limit cost (free parse+validate CPU, unbounded). It
+// must not cost *more* than that: rejects don't scale the charge the way
+// valid events do, so a mixed batch's cost tracks len(valid), floored at 1.
+func TestRejectedEventsConsumeOnlyTheFloorCharge(t *testing.T) {
+	h, sink := newTestHandlerWithQuota(t, 2) // 1 for the garbage floor, 1 for the valid event
 
-	// First request: all events malformed. Must not touch the budget.
+	// First request: all events malformed. Costs the floor charge, not zero.
 	garbage := batchJSON(t, []map[string]any{
 		{"eventId": "not-a-uuid", "name": "bad", "deviceId": "d1", "tsClient": "1754092800000"},
 	})
@@ -192,17 +197,36 @@ func TestRejectedEventsDoNotConsumeQuota(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (malformed events are a partial-success reject, not a batch failure)", rec.Code)
 	}
 
-	// Second request: one valid event. If the first request had spent the
-	// budget, this would 429 instead.
+	// Second request: one valid event. The remaining budget covers exactly
+	// this one event — if the first request had spent more than the floor
+	// charge, this would 429 instead.
 	good := batchJSON(t, []map[string]any{
 		{"eventId": "0191f4a2-1c3d-7000-8000-000000000099", "name": "n", "deviceId": "d1", "tsClient": "1754092800000"},
 	})
 	rec := post(t, h, good, false)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 — a batch of malformed events must not have consumed quota", rec.Code)
+		t.Fatalf("status = %d, want 200 — the garbage batch must not have spent more than its 1-unit floor charge", rec.Code)
 	}
 	if len(sink.rows) != 1 {
 		t.Errorf("inserted %d rows, want 1", len(sink.rows))
+	}
+}
+
+// An all-garbage batch must not be free: it still burns the floor charge, so
+// repeating it drains the budget just like real traffic would.
+func TestAllGarbageBatchStillConsumesQuota(t *testing.T) {
+	h, _ := newTestHandlerWithQuota(t, 1) // budget for exactly one request's floor charge
+
+	garbage := batchJSON(t, []map[string]any{
+		{"eventId": "not-a-uuid", "name": "bad", "deviceId": "d1", "tsClient": "1754092800000"},
+	})
+	if rec := post(t, h, garbage, false); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for the first garbage batch", rec.Code)
+	}
+
+	rec := post(t, h, garbage, false)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 — a repeated all-garbage batch must be rate limited like any other request", rec.Code)
 	}
 }
 

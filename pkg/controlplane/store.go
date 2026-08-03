@@ -70,6 +70,11 @@ func (s *Store) IssueInstall(ctx context.Context, tenantID, platform, subject, d
 	return installID, nil
 }
 
+// LimitsFor falls back to limits.DefaultQuota when a tenant has a client_ids
+// row but no matching quotas row yet — a valid, un-seeded state nothing in
+// this codebase provisions automatically. Erroring here would 503 every
+// batch request forever for that tenant; a documented default keeps ingest
+// usable until an operator sets a real budget.
 func (s *Store) LimitsFor(ctx context.Context, tenantID string, tier uint8) (limits.Quota, error) {
 	var lim limits.Quota
 	var rps0, rps1 int
@@ -77,9 +82,9 @@ func (s *Store) LimitsFor(ctx context.Context, tenantID string, tier uint8) (lim
 		`SELECT daily_events, rps_tier0, rps_tier1, rps_legacy FROM quotas WHERE tenant_id = $1`,
 		tenantID).Scan(&lim.DailyEvents, &rps0, &rps1, &lim.LegacyRPS)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return limits.Quota{}, ErrNotFound
-	}
-	if err != nil {
+		lim = limits.DefaultQuota
+		rps0, rps1 = limits.DefaultQuota.RPS, limits.DefaultRPSTier1
+	} else if err != nil {
 		return limits.Quota{}, err
 	}
 

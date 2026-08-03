@@ -82,6 +82,45 @@ func TestRateLimitWindowRollsOver(t *testing.T) {
 	}
 }
 
+// AllowClient guards POST /v1/auth/token, which has no install_id yet to key
+// Allow's tenant-scoped buckets off — it must deny once the per-key ceiling is
+// hit, and must not share Allow's daily-quota keyspace (spending it here would
+// make token minting eat into the tenant's ingest budget).
+func TestAllowClientDeniesAfterLimitAndDoesNotShareIngestQuota(t *testing.T) {
+	ctx := context.Background()
+	c := quota.NewChecker(startRedis(t))
+	key := "rl:token:pk_live_abc"
+
+	for i := 0; i < 3; i++ {
+		ok, err := c.AllowClient(ctx, key, 3, time.Minute)
+		if err != nil {
+			t.Fatalf("allow client: %v", err)
+		}
+		if !ok {
+			t.Fatalf("call %d denied, want allowed within the limit of 3", i)
+		}
+	}
+
+	ok, err := c.AllowClient(ctx, key, 3, time.Minute)
+	if err != nil {
+		t.Fatalf("allow client: %v", err)
+	}
+	if ok {
+		t.Error("4th call allowed, want denied")
+	}
+
+	// The tenant's ingest daily quota must be untouched by AllowClient calls.
+	cl := tenant.Claims{TenantID: "t1", InstallID: "i-1"}
+	lim := limits.Quota{DailyEvents: 1, RPS: 1000}
+	d, err := c.Allow(ctx, cl, lim, 1, time.Now())
+	if err != nil {
+		t.Fatalf("allow: %v", err)
+	}
+	if !d.Allowed {
+		t.Error("ingest quota already exhausted — AllowClient leaked into Allow's keyspace")
+	}
+}
+
 // Check-and-consume must be one atomic operation. With separate increment,
 // compare, and rollback steps, a denied request's DECRBY can land after another
 // pod's increment and quietly refund budget that was legitimately spent.

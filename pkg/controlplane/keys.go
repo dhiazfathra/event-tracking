@@ -72,6 +72,17 @@ func (s *Store) PublicJWKS(ctx context.Context) (jwk.Set, error) {
 // index makes the second insert fail instead, and ON CONFLICT DO NOTHING
 // turns that failure into "someone else already bootstrapped it" rather than
 // an error the caller has to handle.
+//
+// The `kid` PRIMARY KEY is a second conflict target the partial-index clause
+// alone does not cover: once rotation retires the row for a fixed default kid
+// (e.g. SIGNING_KID's "kid-1"), that row still exists with active=false, so a
+// process starting cold and trying to ensure that same kid hits the PK, not
+// the partial index — an unhandled unique-violation, not a benign no-op. A
+// kid that already exists, active or not, needs nothing done for it. An
+// unqualified `ON CONFLICT DO NOTHING` (no target list) applies to *any*
+// unique or exclusion constraint the insert could hit — both the PK and the
+// partial index — so both races collapse to the same no-op instead of one of
+// them surfacing as an error.
 func (s *Store) EnsureSigningKey(ctx context.Context, kid string) error {
 	pub, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
@@ -81,7 +92,7 @@ func (s *Store) EnsureSigningKey(ctx context.Context, kid string) error {
 		INSERT INTO signing_keys (kid, public_key, private_key, active)
 		SELECT $1, $2, $3, true
 		WHERE NOT EXISTS (SELECT 1 FROM signing_keys WHERE active AND retired_at IS NULL)
-		ON CONFLICT ((true)) WHERE active AND retired_at IS NULL DO NOTHING`,
+		ON CONFLICT DO NOTHING`,
 		kid, []byte(pub), []byte(priv))
 	return err
 }

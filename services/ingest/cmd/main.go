@@ -94,6 +94,7 @@ func main() {
 		Challenges:    attest.RedisChallenges{RDB: rdb, TTL: 5 * time.Minute},
 		ResolveTenant: store.ResolveTenant,
 		IssueInstall:  store.IssueInstall,
+		RateLimit:     checker,
 	}
 
 	mux := http.NewServeMux()

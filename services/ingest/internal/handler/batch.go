@@ -123,7 +123,15 @@ func NewBatch(d Deps) http.Handler {
 			lim.RPS = lim.LegacyRPS
 		}
 
-		dec, err := d.Quota.Allow(r.Context(), claims, lim, len(valid), receivedAt)
+		// Charge at least 1 unit even when every event failed validation.
+		// len(valid)==0 would otherwise read as "nothing to admit" and the Lua
+		// script never touches the counters — letting an all-garbage batch burn
+		// full parse+validate CPU at zero rate-limit cost, unbounded.
+		chargeUnits := len(valid)
+		if chargeUnits == 0 {
+			chargeUnits = 1
+		}
+		dec, err := d.Quota.Allow(r.Context(), claims, lim, chargeUnits, receivedAt)
 		if err != nil {
 			httpError(w, http.StatusServiceUnavailable, "quota unavailable")
 			return

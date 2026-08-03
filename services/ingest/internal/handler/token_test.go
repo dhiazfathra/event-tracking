@@ -19,6 +19,7 @@ import (
 	"github.com/dhiazfathra/event-tracking/pkg/tenant"
 	"github.com/dhiazfathra/event-tracking/services/ingest/internal/attest"
 	"github.com/dhiazfathra/event-tracking/services/ingest/internal/handler"
+	"github.com/dhiazfathra/event-tracking/services/ingest/internal/quota"
 )
 
 // failingAttestor always reports failure, exercising the Tier 1 fallback path.
@@ -229,6 +230,47 @@ func TestClientSuppliedInstallIDIsIgnored(t *testing.T) {
 	// strongest form of "never client-supplied" available.
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 for an unknown installId field", rec.Code)
+	}
+}
+
+// Without a rate limit, rotating device_hint on every call mints an
+// unbounded number of installs rows per tenant. RateLimit caps exchanges per
+// client_id regardless of what's inside the body.
+func TestTokenExchangeIsRateLimitedPerClient(t *testing.T) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	_ = pub
+	minter := tenant.NewMinter(testKID, priv, testIssuer, testAudience, 30*time.Minute)
+	rdb := startRedis(t)
+	installs := &memInstalls{}
+
+	h := handler.NewToken(handler.TokenDeps{
+		Minter:     minter,
+		Attestor:   failingAttestor{},
+		Challenges: attest.RedisChallenges{RDB: rdb, TTL: 5 * time.Minute},
+		ResolveTenant: func(_ context.Context, clientID string) (string, error) {
+			return "t1", nil
+		},
+		IssueInstall: installs.issue,
+		RateLimit:    quota.NewChecker(rdb),
+	})
+
+	body := `{"clientId":"pk_live_abc","platform":"android","deviceHint":"stable-device-1"}`
+	var last *httptest.ResponseRecorder
+	for i := 0; i < 40; i++ {
+		last = postJSON(t, h, "/v1/auth/token", body)
+		if last.Code == http.StatusTooManyRequests {
+			break
+		}
+	}
+	if last.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d after 40 exchanges, want 429 eventually", last.Code)
+	}
+	if last.Header().Get("Retry-After") == "" {
+		t.Error("missing Retry-After header on 429")
 	}
 }
 

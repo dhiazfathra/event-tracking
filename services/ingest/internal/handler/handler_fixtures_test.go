@@ -178,11 +178,20 @@ func newTestHandlerWithQuota(t *testing.T, dailyBudget int64) (http.Handler, *si
 	token := mintToken(t, priv)
 
 	checker := quota.NewChecker(rdb)
-	lim := limits.Quota{DailyEvents: 1, RPS: 1}
+	// RPS tracks dailyBudget (not fixed at 1): callers that need more than one
+	// request to succeed inside the same wall-clock second — e.g. the
+	// floor-charge tests, which need two requests to land against one shared
+	// budget — would otherwise trip the per-second bucket before the daily
+	// one ever comes into play.
+	lim := limits.Quota{DailyEvents: dailyBudget, RPS: int(dailyBudget)}
 	if dailyBudget == 0 {
-		// Spend the single unit of budget up front so the test's own request
-		// is guaranteed to be denied, regardless of how the RPS bucket's
-		// per-second window happens to line up with wall-clock time.
+		// Spend a single unit of budget up front so the test's own request is
+		// guaranteed to be denied, regardless of how the RPS bucket's
+		// per-second window happens to line up with wall-clock time. RPS=0
+		// alone would not deny anything: quota.Allow treats <=0 as
+		// unenforced, so the limit must be positive with the budget already
+		// spent, not literally zero.
+		lim = limits.Quota{DailyEvents: 1, RPS: 1}
 		if _, err := checker.Allow(context.Background(), tenant.Claims{TenantID: "t1", InstallID: "i-1"}, lim, 1, time.Now()); err != nil {
 			t.Fatalf("pre-consume quota: %v", err)
 		}

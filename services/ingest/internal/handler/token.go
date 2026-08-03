@@ -14,6 +14,7 @@ import (
 	trackingv1 "github.com/dhiazfathra/event-tracking/gen/go/tracking/v1"
 	"github.com/dhiazfathra/event-tracking/pkg/tenant"
 	"github.com/dhiazfathra/event-tracking/services/ingest/internal/attest"
+	"github.com/dhiazfathra/event-tracking/services/ingest/internal/quota"
 )
 
 type TokenDeps struct {
@@ -30,8 +31,23 @@ type TokenDeps struct {
 	// Tier 1 it keys off deviceKey (below).
 	IssueInstall func(ctx context.Context, tenantID, platform, subject, deviceKey string, tier uint8) (string, error)
 
+	// RateLimit caps token exchanges per client_id. Without it, an
+	// unauthenticated caller can mint an unbounded number of installs rows by
+	// rotating device_hint on every call. Optional: nil skips the check (used
+	// by existing tests that don't exercise this).
+	RateLimit *quota.Checker
+
 	Now func() time.Time
 }
+
+// tokenRatePerMinute and tokenRateWindow bound POST /v1/auth/token per
+// client_id. Generous on purpose — this guards against write amplification
+// (installs row growth), not against a determined attacker; the tenant-wide
+// ingest quota is the real budget protection.
+const (
+	tokenRatePerMinute = 30
+	tokenRateWindow    = time.Minute
+)
 
 // NewToken serves POST /v1/auth/token: the public client ID plus a platform
 // attestation are exchanged for a short-lived scoped JWT.
@@ -64,6 +80,20 @@ func NewToken(d TokenDeps) http.Handler {
 		if err != nil {
 			httpError(w, http.StatusUnauthorized, "unknown client_id")
 			return
+		}
+
+		if d.RateLimit != nil {
+			key := "rl:token:" + req.GetClientId()
+			ok, err := d.RateLimit.AllowClient(r.Context(), key, tokenRatePerMinute, tokenRateWindow)
+			if err != nil {
+				httpError(w, http.StatusServiceUnavailable, "rate limit unavailable")
+				return
+			}
+			if !ok {
+				w.Header().Set("Retry-After", "60")
+				httpError(w, http.StatusTooManyRequests, "rate_limit")
+				return
+			}
 		}
 
 		// Tier 0 requires a live, unspent challenge. A replayed attestation
