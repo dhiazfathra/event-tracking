@@ -2,7 +2,7 @@
 
 Multi-tenant event tracking platform: Go services + ClickHouse for ingestion, storage, and querying, with a local-first Flutter SDK for offline event capture and background sync.
 
-**Status: design only.** No implementation yet. The design is approved and documented; the next step is an implementation plan.
+**Status: `services/ingest` implemented.** `services/query` and the Flutter SDK are still design only.
 
 ## Design
 
@@ -24,6 +24,10 @@ It covers the high-level architecture, monorepo layout and module boundaries, th
 
 Decisions are not deleted when they change. Supersede them with a new ADR that references the old one.
 
+## Services
+
+- [`services/ingest`](services/ingest/README.md) — token exchange and event ingestion
+
 ## Planned Layout
 
 ```text
@@ -43,7 +47,7 @@ Boundary rules, enforced in CI: `services/*` never import each other; the Flutte
 
 ### Prerequisites
 
-- Go 1.23+
+- Go 1.26+
 - [`buf`](https://buf.build/docs/installation) 1.47+
 - Dart 3.5+ / Flutter 3.24+ (only for `clients/flutter_sdk`)
 
@@ -74,6 +78,38 @@ would fail if that ever changed.
 
 So neither a Go build nor `flutter pub get` requires the proto toolchain. The
 cost is merge noise, paid for by the `make gen-check` CI gate.
+
+### Running the ingest service
+
+`services/ingest` is a runnable binary: `POST /v1/auth/challenge`,
+`POST /v1/auth/token`, `POST /v1/batch`, and `GET /.well-known/jwks.json`,
+backed by ClickHouse (events), Postgres (tenants, installs, quotas, signing
+keys), and Redis (rate limiting, attestation challenges).
+
+```bash
+docker compose -f deploy/docker-compose.yml up --build
+# ingest listens on :8080; /healthz and /readyz report liveness/readiness
+```
+
+Config is environment variables, all defaulted for local use:
+`CLICKHOUSE_ADDRS`, `CLICKHOUSE_DB`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`,
+`POSTGRES_DSN`, `REDIS_ADDR`, `TOKEN_ISSUER`, `TOKEN_AUDIENCE`, `JWKS_URL`,
+`SIGNING_KID`, `LISTEN_ADDR`. Both ClickHouse and Postgres schemas are migrated
+by the service itself at startup — there is no separate migration step or
+container.
+
+The Postgres control plane (`pkg/controlplane`) owns tenant/client-ID
+resolution, install issuance, quotas, legacy write-key resolution, and the
+Ed25519 signing key the exchange mints with and the JWKS endpoint publishes —
+one key source for both, so a token the service just issued always verifies
+against its own JWKS.
+
+Run the end-to-end suite (requires Docker; boots real ClickHouse, Postgres, and
+Redis via testcontainers):
+
+```bash
+cd services/ingest && go test -tags e2e ./internal/handler/...
+```
 
 ### Wire format
 

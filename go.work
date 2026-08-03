@@ -1,8 +1,12 @@
-go 1.23
+go 1.26.5
 
 use (
 	./gen/go
+	./pkg/clickhouse
+	./pkg/controlplane
 	./pkg/limits
+	./pkg/tenant
 	./pkg/testsupport
+	./services/ingest
 	./tools
 )

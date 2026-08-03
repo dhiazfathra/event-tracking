@@ -34,3 +34,20 @@ type Quota struct {
 	// absorbs, because it backs off on 429.
 	LegacyRPS int
 }
+
+// DefaultQuota is what a tenant gets when no row exists in the `quotas`
+// table yet. Provisioning a client_id without a matching quotas row is a
+// valid, un-seeded local-dev/staging state — nothing in this codebase inserts
+// one automatically — and the rest of the service already treats "missing
+// config" this way (see env() in cmd/main.go, or Deps.Now's default) rather
+// than erroring. Values mirror the column defaults in
+// migrations/postgres/0001_control_plane.sql.
+var DefaultQuota = Quota{
+	DailyEvents: 1_000_000,
+	RPS:         50, // tier 0; LimitsFor applies DefaultRPSTier1 for tier 1
+	LegacyRPS:   5,
+}
+
+// DefaultRPSTier1 is DefaultQuota's tier-1 rate, kept separate because Quota
+// only carries one RPS field (the caller's tier picks which column applies).
+const DefaultRPSTier1 = 10
