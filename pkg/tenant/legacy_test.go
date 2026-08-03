@@ -46,6 +46,27 @@ func TestLegacyKeyAcceptedInDualAcceptMode(t *testing.T) {
 	}
 }
 
+// The Bearer scheme is case-insensitive per RFC 6750/7235. Verify already
+// handles this; VerifyOrLegacy's own classification must agree, or a
+// lowercase "bearer wk_live_..." falls through to the JWT path and 401s.
+func TestLegacyKeyAcceptedWithLowercaseBearerScheme(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(nil)
+	js := newJWKS(t, "kid-1", pub, "sig", "OKP")
+	v := tenant.NewVerifier(js.URL, testIssuer, testAudience, js.Client())
+
+	claims, isLegacy, err := v.VerifyOrLegacy(context.Background(), "bearer wk_live_abc123", time.Now(),
+		stubResolver{tenantID: "t1", mode: tenant.ModeDualAccept})
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !isLegacy {
+		t.Error("isLegacy = false, want true — lowercase scheme must still classify as a legacy key")
+	}
+	if claims.TenantID != "t1" {
+		t.Errorf("tenant = %q, want t1", claims.TenantID)
+	}
+}
+
 // Cutoff is the whole point of the migration: a leaked key must stop working as
 // an ingest bearer credential, or the short token lifetime buys nothing.
 func TestLegacyKeyRejectedAtCutoff(t *testing.T) {

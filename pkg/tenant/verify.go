@@ -63,15 +63,21 @@ func NewVerifier(jwksURL, issuer, audience string, client *http.Client) *Verifie
 	return &Verifier{url: jwksURL, issuer: issuer, audience: audience, client: client}
 }
 
+// stripBearer removes a case-insensitive "Bearer " scheme prefix per RFC
+// 6750/7235. Shared by Verify and VerifyOrLegacy so JWT and legacy-key
+// classification never disagree about where the scheme ends.
+func stripBearer(bearer string) string {
+	if scheme, rest, ok := strings.Cut(bearer, " "); ok && strings.EqualFold(scheme, "Bearer") {
+		return strings.TrimSpace(rest)
+	}
+	return bearer
+}
+
 // Verify checks every acceptance condition and returns the claims. Ingest is a
 // hot path: this does signature verification and claim checks only — no
 // database lookup, no attestation. Attestation happened at the exchange.
 func (v *Verifier) Verify(ctx context.Context, bearer string, now time.Time) (Claims, error) {
-	raw := []byte(bearer)
-	if scheme, rest, ok := strings.Cut(bearer, " "); ok && strings.EqualFold(scheme, "Bearer") {
-		raw = []byte(strings.TrimSpace(rest))
-	}
-
+	raw := []byte(stripBearer(bearer))
 	msg, err := jws.Parse(raw)
 	if err != nil || len(msg.Signatures()) != 1 {
 		return Claims{}, fmt.Errorf("%w: %v", ErrMalformed, err)
@@ -179,7 +185,7 @@ func (v *Verifier) key(ctx context.Context, kid string, now time.Time) (jwk.Key,
 		// Without this, every request during a JWKS outage queues behind a
 		// fetch that will time out, serializing the hot path.
 		var err error
-		if v.set == nil || now.Sub(v.lastRefetch) >= jwksMinRefetch {
+		if now.Sub(v.lastRefetch) >= jwksMinRefetch {
 			err = v.refetchLocked(ctx, now)
 		} else {
 			err = errors.New("refresh suppressed by rate limit")

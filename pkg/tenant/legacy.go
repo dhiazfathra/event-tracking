@@ -37,7 +37,7 @@ type LegacyResolver interface {
 // caller can apply the tighter rps_legacy limit and count the usage per tenant
 // and SDK version — that count is what tells you when cutoff is safe.
 func (v *Verifier) VerifyOrLegacy(ctx context.Context, bearer string, now time.Time, lr LegacyResolver) (Claims, bool, error) {
-	raw := strings.TrimPrefix(bearer, "Bearer ")
+	raw := stripBearer(bearer)
 
 	if !strings.HasPrefix(raw, LegacyPrefix) {
 		c, err := v.Verify(ctx, bearer, now)

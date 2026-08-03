@@ -182,9 +182,13 @@ func main() {
 	}()
 
 	<-ctx.Done()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	// Longer than WriteTimeout: a slow upload already in flight must be able
+	// to finish and get its response before Shutdown gives up on it.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*srv.WriteTimeout)
 	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error("shutdown", "err", err)
+	}
 }
 
 func env(k, def string) string {

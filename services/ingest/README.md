@@ -58,7 +58,7 @@ to bound install-row write amplification from `device_hint` churn — see
 ## Local development
 
 ```bash
-docker compose -f deploy/docker-compose.yml up -d clickhouse postgres redis
+docker compose -f deploy/docker-compose.yml up -d --wait clickhouse postgres redis
 go run ./services/ingest/cmd
 ```
 
