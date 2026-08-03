@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package tracking.v1;
+
+// Value is the property union. Deliberately closed: props are analytics
+// dimensions, not arbitrary documents. Nested objects would make the
+// ClickHouse JSON subcolumn explosion unbounded.
+message Value {
+  oneof kind {
+    string string_value = 1;
+    double number_value = 2;
+    bool   bool_value   = 3;
+  }
+}
+
+// Context is SDK-populated, not host-app populated.
+message Context {
+  string sdk_version = 1;
+  string app_version = 2;
+  string os          = 3;
+  string os_version  = 4;
+  string locale      = 5;
+}
+
+// Event is the ingestion envelope.
+//
+// tenant_id is deliberately absent. It is read server-side from the verified
+// token's tenant_id claim. A client-supplied tenant field is a cross-tenant
+// write primitive.
+message Event {
+  string event_id     = 1;  // UUID v7, client-generated. Dedup key + rough time ordering.
+  string name         = 2;
+  int64  ts_client    = 3;  // client wall clock, millis. Untrusted.
+  uint64 seq          = 4;  // per-device monotonic. Gap detection only.
+  string device_id    = 5;
+  string session_id   = 6;
+  string anonymous_id = 7;
+  string user_id      = 8;  // empty until identify()
+  map<string, Value> props = 9;
+  Context context     = 10;
+}

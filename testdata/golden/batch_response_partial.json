@@ -1,0 +1,14 @@
+{
+  "receivedAt": "1754092800412",
+  "accepted": [
+    "0191f4a2-1c3d-7000-8000-000000000001",
+    "0191f4a2-1c3d-7000-8000-000000000002"
+  ],
+  "rejected": [
+    {
+      "eventId": "0191f4a2-1c3d-7000-8000-000000000003",
+      "code": "INVALID_PROPERTY_TYPE",
+      "message": "props.amount: expected number"
+    }
+  ]
+}

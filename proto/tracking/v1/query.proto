@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package tracking.v1;
+
+// The query DSL. Constrained on purpose: compiled to parameterized SQL,
+// never passed through as SQL. tenant_id appears nowhere — the query service
+// injects it server-side from the verified read key.
+
+enum Op {
+  OP_UNSPECIFIED = 0;
+  OP_EQ          = 1;
+  OP_NEQ         = 2;
+  OP_IN          = 3;
+  OP_GT          = 4;
+  OP_LT          = 5;
+}
+
+message Filter {
+  string field = 1;            // allowlisted column or "props.<key>"
+  Op     op    = 2;
+  repeated string values = 3;  // always strings on the wire; cast at compile time
+}
+
+enum Interval {
+  INTERVAL_UNSPECIFIED = 0;
+  INTERVAL_HOUR        = 1;
+  INTERVAL_DAY         = 2;
+  INTERVAL_WEEK        = 3;
+}
+
+enum Metric {
+  METRIC_UNSPECIFIED = 0;
+  METRIC_EVENTS      = 1;  // uniqExact(event_id)
+  METRIC_USERS       = 2;  // uniqExact(user_id)
+}
+
+message TimeseriesRequest {
+  string   event_name = 1;
+  int64    from_ms    = 2;
+  int64    to_ms      = 3;
+  Interval interval   = 4;
+  Metric   metric     = 5;
+  repeated Filter filters = 6;
+  repeated string group_by = 7;   // allowlisted dimensions, max 2
+  bool approximate = 8;           // uniq() HLL instead of uniqExact()
+}
+
+message Point {
+  int64  bucket_ms = 1;
+  uint64 value     = 2;
+}
+
+message Series {
+  map<string, string> group = 1;  // empty when group_by is empty
+  repeated Point points = 2;
+}
+
+message TimeseriesResponse {
+  repeated Series series = 1;
+  string source      = 2;   // "raw" | "rollup" — never conflate the two
+  bool   approximate = 3;
+  int64  computed_at = 4;
+  string etag        = 5;
+}

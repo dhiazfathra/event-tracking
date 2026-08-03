@@ -1,0 +1,69 @@
+name: CI
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0   # buf breaking needs history
+          persist-credentials: false
+      - uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
+        with:
+          go-version: '1.23'
+      - uses: bufbuild/buf-setup-action@9672cee01808979ea1249f81d6d321217b9a10f6 # v1.47.2
+        with:
+          version: 1.47.2
+
+      - name: Lint protos
+        run: buf lint
+
+      # An SDK deployed into third-party apps cannot be force-upgraded, so a
+      # breaking envelope change is unfixable once shipped.
+      # Single quotes would pass the literal $(...) to buf. The tag and the
+      # no-tag fallback also need different buf revision syntax: `tag=` only
+      # accepts a real tag, so HEAD~1 must be given as `ref=`.
+      - name: Breaking change check
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -n "$tag" ]; then
+            against=".git#tag=$tag"
+          elif [ -n "$PR_BASE_SHA" ]; then
+            # actions/checkout builds a synthetic merge commit for pull_request
+            # events, so HEAD~1 is unreliable; use the PR's actual base sha.
+            against=".git#ref=$PR_BASE_SHA"
+          else
+            against='.git#ref=HEAD~1'
+          fi
+          # If the comparison ref predates buf.yaml/proto module, there is
+          # nothing to diff against and buf errors instead of no-op'ing.
+          ref=${against#*ref=}
+          ref=${ref#*tag=}
+          if git cat-file -e "$ref:buf.yaml" 2>/dev/null; then
+            buf breaking --against "$against"
+          else
+            echo "Comparison ref has no buf.yaml yet; skipping breaking check."
+          fi
+
+      - name: Generated code is up to date
+        run: make gen-check
+
+      - name: Module boundaries
+        run: make check-boundaries
+
+      - name: Go tests
+        run: make test
